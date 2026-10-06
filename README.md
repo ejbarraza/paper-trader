@@ -93,7 +93,11 @@ hold keys, or touch a wallet. That is deliberate, not a missing feature.
     price)` shares and holds. No rebalancing, no exits. Give it an
     allocation with `--pie "AAPL:30,MSFT:30,VTI:40"` or `--pie pies/tech-leaders.json`
     (see `pies/` for samples); it is sized to `--capital`. Run it as the whole
-    account and the equity curve is the pie's balance over time.
+    account and the equity curve is the pie's balance over time. Run a pie
+    **standalone in its own DB** (`--strategies pie --db pie.db`): positions
+    net across strategies inside one account, so mixing a pie with active
+    strategies (e.g. meanrev shorts) would eat into the buy-and-hold legs.
+    For benchmarks, run the pie alone and compare ledgers.
 - **Dashboard** (`dashboard.py`) — read-only Flask app: equity curve,
   positions, per-strategy P&L, trade tape, and the risk-event log. The
   **Edge** panel charts each strategy's cumulative *realized* P&L (closed
