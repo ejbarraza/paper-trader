@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
                     choices=["stocks", "options", "predictions"],
                     help="what the CSV files contain")
     ap.add_argument("--strategies", default="momentum,meanrev",
-                    help="comma-separated: vrp,momentum,meanrev")
+                    help="comma-separated: vrp,momentum,meanrev,endgame")
     ap.add_argument("--scanner-dir", default="../options_scanner/outputs",
                     help="options-scanner outputs dir (vrp strategy)")
     ap.add_argument("--capital", type=float, default=100_000.0)
@@ -64,11 +64,22 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--port", type=int, default=5000)
     ap.add_argument("--list-strategies", action="store_true",
                     help="show registered strategies and their asset classes")
+    ap.add_argument("--discover", action="store_true",
+                    help="scan Polymarket for liquid tradeable markets and exit")
+    ap.add_argument("--min-volume", type=float, default=100_000.0)
+    ap.add_argument("--min-liquidity", type=float, default=10_000.0)
+    ap.add_argument("--max-markets", type=int, default=25)
     ap.add_argument("--collect", type=float, default=0,
                     help="with --feed polymarket_ws: record live ticks for this "
                          "many seconds instead of running the engine")
     ap.add_argument("--out", default="ticks.csv",
                     help="output CSV for --collect")
+    ap.add_argument("--resample", default="",
+                    help="resample a ticks.csv (from --collect) into OHLC bars "
+                         "and exit")
+    ap.add_argument("--resample-out", default="bars.csv")
+    ap.add_argument("--resample-freq", type=int, default=60,
+                    help="bar width in seconds for --resample")
     ap.add_argument("--live", action="store_true",
                     help="paper-forward mode: step the engine on live quotes "
                          "instead of replaying history")
@@ -76,6 +87,9 @@ def parse_args() -> argparse.Namespace:
                     help="seconds between live steps")
     ap.add_argument("--duration", type=float, default=0,
                     help="live run length in seconds (0 = until Ctrl-C)")
+    ap.add_argument("--alert-url", default="",
+                    help="webhook URL for live session/kill-switch alerts "
+                         "(POSTs JSON; e.g. Slack, Discord, ntfy)")
     return ap.parse_args()
 
 
@@ -86,6 +100,28 @@ def main() -> None:
         for d in describe_strategies():
             print(f"{d['name']:10s} {d['strategy']:12s} "
                   f"{','.join(d['asset_classes']):28s} {d['blurb']}")
+        return
+    if args.discover:
+        from discover import discover_markets
+        try:
+            markets = discover_markets(args.min_volume, args.min_liquidity,
+                                       args.max_markets)
+        except Exception as e:
+            print(f"discovery failed: {e}")
+            return
+        print(f"{'slug':58s} {'volume':>12s} {'liquidity':>12s}  question")
+        for m in markets:
+            print(f"{m['slug'][:58]:58s} {m['volume']:12,.0f} "
+                  f"{m['liquidity']:12,.0f}  {m['question'][:60]}")
+        print(f"\n{len(markets)} markets; pass slugs via --symbols")
+        return
+    if args.resample:
+        from resample import resample_ticks
+        n = resample_ticks(args.resample, args.resample_out,
+                           args.resample_freq)
+        print(f"{n} bars -> {args.resample_out} "
+              f"(backtest with --feed csv --csv-dir "
+              f"{args.resample_out.rsplit('/', 1)[0] or '.'})")
         return
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     feed_kwargs = {"directory": args.csv_dir,
@@ -102,7 +138,12 @@ def main() -> None:
 
     strats = []
     for spec in [s.strip() for s in args.strategies.split(",") if s.strip()]:
-        kw = {"scanner_dir": args.scanner_dir} if spec == "vrp" else {}
+        if spec == "vrp":
+            kw = {"scanner_dir": args.scanner_dir}
+        elif spec == "endgame":
+            kw = {"symbols": symbols}
+        else:
+            kw = {}
         strats.append(build_strategy(spec, **kw))
     print(f"feed={feed.name} symbols={symbols} "
           f"strategies={[s.name for s in strats]}")
@@ -124,7 +165,8 @@ def main() -> None:
             print(f"dashboard: http://127.0.0.1:{args.port} (live)")
         summary = engine.run_live(
             symbols, interval_s=args.interval,
-            duration_s=args.duration or None)
+            duration_s=args.duration or None,
+            alert_url=args.alert_url or None)
     else:
         summary = engine.run(symbols, date.fromisoformat(args.start),
                              date.fromisoformat(args.end))

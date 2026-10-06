@@ -96,5 +96,113 @@ class Ledger:
                    COUNT(*) AS n_trades
             FROM trades GROUP BY strategy ORDER BY net DESC""")
 
+    def strategy_stats(self) -> list[dict]:
+        """Per-strategy attribution with FIFO-matched win/loss.
+
+        ``net`` is total cash flow (exact, includes open positions' costs).
+        Wins/losses come from FIFO-matching closes against opens per
+        (strategy, symbol): spot buy/sell/resolve, put sell/close/expire.
+        An assigned put keeps its premium as realized and opens a stock lot
+        at the strike (exactly what the engine records).
+        """
+        trades = self._all("SELECT * FROM trades ORDER BY id")
+        # (strategy, symbol) -> list of [qty, price]; qty<0 means short/open put
+        spot_lots: dict[tuple, list] = {}
+        put_lots: dict[tuple, list] = {}
+        stats: dict[str, dict] = {}
+
+        def st(s):
+            return stats.setdefault(s, {"strategy": s, "net": 0.0,
+                                        "n_trades": 0, "wins": 0, "losses": 0,
+                                        "realized": 0.0})
+
+        def match(lots, key, qty, price, pnl_sign):
+            """Close `qty` against FIFO lots; returns realized P&L."""
+            realized = 0.0
+            book = lots.setdefault(key, [])
+            while qty > 1e-9 and book:
+                lq, lp = book[0]
+                m = min(qty, abs(lq))
+                realized += pnl_sign * m * (price - lp) * (1 if lq > 0 else -1)
+                qty -= m
+                if abs(lq) - m < 1e-9:
+                    book.pop(0)
+                else:
+                    book[0][0] = lq - m * (1 if lq > 0 else -1)
+            return realized, qty
+
+        for t in trades:
+            s, sym, a = t["strategy"], t["symbol"], t["action"]
+            q, px, cd = t["qty"], t["price"], t["cash_delta"]
+            row = st(s)
+            row["net"] += cd
+            row["n_trades"] += 1
+            key = (s, sym)
+            if a == "buy":
+                # cover shorts first, then open long
+                realized, rem = match(spot_lots, key, q, px, +1)
+                row["realized"] += realized
+                self._bump_wl(row, realized)
+                if rem > 1e-9:
+                    spot_lots.setdefault(key, []).append([rem, px])
+            elif a == "sell":
+                # close longs first, then open short
+                realized, rem = match(spot_lots, key, q, px, +1)
+                row["realized"] += realized
+                self._bump_wl(row, realized)
+                if rem > 1e-9:
+                    spot_lots.setdefault(key, []).append([-rem, px])
+            elif a == "resolve":
+                realized, _ = match(spot_lots, key, abs(q), px, +1)
+                # shorts: realized sign flips via lot sign in match()
+                row["realized"] += realized
+                self._bump_wl(row, realized)
+            elif a == "sell_put":
+                put_lots.setdefault(key, []).append([q, px])
+            elif a == "buy_put_close":
+                realized, _ = match(put_lots, key, q, px, -1)
+                row["realized"] += realized
+                self._bump_wl(row, realized)
+            elif a == "expiry_worthless":
+                for lq, lp in put_lots.pop(key, []):
+                    row["realized"] += lq * lp
+                    self._bump_wl(row, lq * lp)
+            elif a == "expiry_assign":
+                for lq, lp in put_lots.pop(key, []):
+                    row["realized"] += lq * lp  # premium kept
+                    self._bump_wl(row, lq * lp)
+                spot_lots.setdefault(key, []).append([q, px])  # shares @ strike
+        out = []
+        for r in stats.values():
+            w, l = r["wins"], r["losses"]
+            r["win_rate"] = (w / (w + l)) if (w + l) else None
+            out.append(r)
+        return sorted(out, key=lambda r: r["net"], reverse=True)
+
+    @staticmethod
+    def _bump_wl(row: dict, realized: float) -> None:
+        if abs(realized) < 1e-9:
+            return
+        if realized > 0:
+            row["wins"] += 1
+        else:
+            row["losses"] += 1
+
+    def portfolio_summary(self) -> dict:
+        """Equity, return, and max drawdown from the equity curve."""
+        curve = self.equity_curve()
+        if not curve:
+            return {"equity": 0.0, "cash": 0.0, "return_pct": 0.0,
+                    "max_drawdown_pct": 0.0, "n_points": 0}
+        eq = [c["equity"] for c in curve]
+        peak, max_dd = eq[0], 0.0
+        for v in eq:
+            peak = max(peak, v)
+            if peak > 0:
+                max_dd = max(max_dd, (peak - v) / peak)
+        return {"equity": eq[-1], "cash": curve[-1]["cash"],
+                "return_pct": (eq[-1] / eq[0] - 1) * 100 if eq[0] else 0.0,
+                "max_drawdown_pct": max_dd * 100, "n_points": len(eq)}
+
     def close(self) -> None:
         self._db.close()

@@ -57,6 +57,11 @@ hold keys, or touch a wallet. That is deliberate, not a missing feature.
     long-only.
   - `meanrev` **[stocks, predictions]** — z-score fade, long or short, with a
     hard stop.
+  - `endgame` **[predictions]** — the mechanical leg of the classic
+    endgame trade: in a market's final window, buys the Yes (or No) ask at
+    ≤5¢ and holds to resolution; the engine settles via the feed's
+    `settlements()`. No outcome oracle is modeled — the backtest hit-rate
+    is the honest metric.
 - **Feeds** declare what they provide (`yahoo` → stocks, `polymarket` →
   predictions, `csv` → your choice via `--csv-asset-class`). See them with
   `python run.py --list-strategies`.
@@ -126,19 +131,45 @@ fills cross the actual spread (buys lift the ask, sells hit the bid) instead
 of using a synthetic slippage around the close. Strategies warm up from feed
 history when the feed has one (Yahoo does; the websocket warms up live).
 Everything still passes through the shared risk arbiter and lands in the
-same SQLite ledger the dashboard reads.
+same SQLite ledger the dashboard reads. For unattended runs, pass
+`--alert-url <webhook>` — the engine POSTs JSON on session start/stop and
+on the first kill-switch trip of each reason, and writes `heartbeat.json`
+next to the DB every step so the dashboard's banner reads LIVE/STALE.
+
+Find tradeable markets instead of hand-feeding slugs:
+
+```bash
+./.venv/bin/python run.py --discover --min-volume 100000 \
+  --min-liquidity 10000 --max-markets 25
+```
+
+## Testing
+
+```bash
+./.venv/bin/python -m pytest tests/ -q   # 60+ tests, no network needed
+```
+
+Covers the feed registry and WS book parser (synthetic messages), strategy
+signal logic, every arbiter rule, spread-aware fills, backtest regression,
+the live loop (fake feed), FIFO attribution, settlement parsing, the tick
+resampler, and discovery filters.
 
 ## Repo layout
 
 ```
 feeds.py       # MarketDataFeed interface: yahoo / polymarket (.com REST) /
                #   polymarket_us / polymarket_ws (live order-book socket) / csv
-strategies.py  # Strategy interface + vrp, momentum, meanrev loops
+strategies.py  # Strategy interface + vrp, momentum, meanrev, endgame loops
 risk.py        # RiskArbiter: budgets, exposure caps, kill-switches
-engine.py      # PaperEngine: event loop, fills, expiry, marks
+engine.py      # PaperEngine: backtest replay + paper-forward live loop,
+               #   spread-aware fills, option expiry, prediction settlement
 pricing.py     # Black-Scholes put pricer (option marks)
-ledger.py      # SQLite: trades, equity, risk_events, position snapshots
-dashboard.py   # read-only Flask operator view
+ledger.py      # SQLite: trades, equity, risk_events, position snapshots,
+               #   FIFO attribution, portfolio summary
+dashboard.py   # read-only Flask operator view (health, attribution)
+resample.py    # tick CSV -> OHLC bars for backtesting recordings
+discover.py    # Gamma scan for liquid, order-book-enabled markets
+tests/         # pytest suite (no network)
 run.py         # CLI
 ```
 
@@ -167,6 +198,10 @@ Register both in the `build_*` tables and they work everywhere.
   are no historical chains, so intraday option P&L is modeled, not observed.
 - Fills assume infinite liquidity at the quoted price plus slippage — real
   markets are worse. This is a strategy laboratory, not a promise.
+- Prediction-market settlement only fires on **decisive** Gamma resolutions;
+  ambiguous markets stay marked at last price. The endgame loop has no
+  outcome oracle — its paper P&L includes markets that resolve against the
+  position, which is the point: the hit-rate is the metric.
 - Backtests are in-sample by construction when you tune on them. Don't.
 
 ## Disclaimer

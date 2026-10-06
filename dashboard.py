@@ -37,12 +37,13 @@ canvas{width:100%;height:260px;background:#161b22;border:1px solid #30363d;borde
 section{margin-bottom:28px}h2{font-size:16px;margin-bottom:8px}
 .pill{display:inline-block;padding:2px 10px;border-radius:20px;font-size:12px;background:#21262d}
 </style></head><body>
-<h1>Paper Trader <span class="pill">paper only — no live orders</span></h1>
+<h1>Paper Trader <span class="pill">paper only — no live orders</span>
+  <span class="pill" id="health">checking…</span></h1>
 <div class="sub">strategy loops · shared risk arbiter · simulated fills</div>
 <div class="cards" id="cards"></div>
 <section><h2>Equity curve</h2><canvas id="eq" width="900" height="260"></canvas></section>
 <section><h2>Open positions</h2><table id="pos"><tr><th>Position</th><th>Qty</th><th>Mark</th><th>Value</th></tr></table></section>
-<section><h2>Strategy P&amp;L</h2><table id="strat"><tr><th>Strategy</th><th>Asset class</th><th>Trades</th><th>Net P&amp;L</th></tr></table></section>
+<section><h2>Strategy P&amp;L</h2><table id="strat"><tr><th>Strategy</th><th>Asset class</th><th>Trades</th><th>Win rate</th><th>Net P&amp;L</th></tr></table></section>
 <section><h2>Recent trades</h2><table id="trades"><tr><th>Time</th><th>Strategy</th><th>Symbol</th><th>Action</th><th>Qty</th><th>Price</th><th>Cash Δ</th><th>Note</th></tr></table></section>
 <section><h2>Risk events <span style="color:#8b949e;font-weight:normal">(orders the arbiter blocked)</span></h2><table id="risk"><tr><th>Time</th><th>Strategy</th><th>Symbol</th><th>Action</th><th>Reason</th></tr></table></section>
 <script>
@@ -55,10 +56,12 @@ function row(t,cells){const tr=document.createElement('tr');cells.forEach(c=>{co
  const first=eq.length?eq[0].equity:last.equity;
  const ret=first?((last.equity/first-1)*100):0;
  const cls=ret>=0?'up':'down';
+ const sm=await j('/api/summary');
  document.getElementById('cards').innerHTML=
   `<div class="card"><div class="k">Equity</div><div class="v">${fmt$(last.equity)}</div></div>
    <div class="card"><div class="k">Cash</div><div class="v">${fmt$(last.cash)}</div></div>
    <div class="card"><div class="k">Return</div><div class="v ${cls}">${ret.toFixed(2)}%</div></div>
+   <div class="card"><div class="k">Max drawdown</div><div class="v down">${sm.max_drawdown_pct.toFixed(1)}%</div></div>
    <div class="card"><div class="k">Data points</div><div class="v">${eq.length}</div></div>`;
  // chart
  const cv=document.getElementById('eq'),cx=cv.getContext('2d');
@@ -69,7 +72,15 @@ function row(t,cells){const tr=document.createElement('tr');cells.forEach(c=>{co
  const pos=await j('/api/positions');
  pos.forEach(p=>row(document.getElementById('pos'),[p.pkey,p.qty,fmt$(p.mark),fmt$(p.qty*p.mark)]));
  const st=await j('/api/strategies');
- st.forEach(s=>row(document.getElementById('strat'),[s.strategy,s.asset_class,s.n_trades,`<span class="${s.net>=0?'up':'down'}">${fmt$(s.net)}</span>`]));
+ st.forEach(s=>row(document.getElementById('strat'),[s.strategy,s.asset_class,s.n_trades,s.win_rate==null?'—':(s.win_rate*100).toFixed(0)+'%',`<span class="${s.net>=0?'up':'down'}">${fmt$(s.net)}</span>`]));
+ async function health(){
+  const hl=await j('/api/health');
+  const hel=document.getElementById('health');
+  if(hl.status==='live'){hel.textContent=`LIVE · ${hl.age_s}s ago`;hel.style.background='#1a3a24';hel.style.color='#3fb950'}
+  else if(hl.status==='stale'){hel.textContent=`STALE · ${Math.round(hl.age_s/60)}m ago`;hel.style.background='#3a1a1a';hel.style.color='#f85149'}
+  else{hel.textContent='no live session';hel.style.background='#21262d'}
+ }
+ await health(); setInterval(health,15000);
  const tr=await j('/api/trades');
  tr.slice(0,50).forEach(t=>row(document.getElementById('trades'),[t.ts.slice(0,16),t.strategy,t.symbol,t.action,t.qty,fmt$(t.price),fmt$(t.cash_delta),(t.note||'').slice(0,60)]));
  const rk=await j('/api/risk');
@@ -92,15 +103,42 @@ def create_app(db_path: str):
     def api_equity():
         return jsonify(led.equity_curve())
 
+    @app.get("/api/summary")
+    def api_summary():
+        s = led.portfolio_summary()
+        s["n_trades"] = sum(r["n_trades"] for r in led.strategy_pnl())
+        s["n_risk_events"] = len(led.risk_events(limit=100000))
+        return jsonify(s)
+
+    @app.get("/api/health")
+    def api_health():
+        """Dead-man's switch: LIVE/STALE from the engine's heartbeat file."""
+        import json as _json
+        import os
+        from datetime import datetime
+        d = os.path.dirname(os.path.abspath(db_path)) or "."
+        try:
+            with open(os.path.join(d, "heartbeat.json")) as f:
+                hb = _json.load(f)
+            age = (datetime.now() -
+                   datetime.fromisoformat(hb["ts"])).total_seconds()
+            return jsonify({"status": "live" if age < 180 else "stale",
+                            "age_s": round(age), "equity": hb.get("equity"),
+                            "step": hb.get("step")})
+        except Exception:
+            return jsonify({"status": "never", "age_s": None})
+
     @app.get("/api/positions")
     def api_positions():
         return jsonify(led.latest_positions())
 
     @app.get("/api/strategies")
     def api_strategies():
-        rows = led.strategy_pnl()
+        rows = led.strategy_stats()
         for r in rows:
             r["asset_class"] = _STRAT_ASSET.get(r["strategy"], "?")
+            w, l = r["wins"] or 0, r["losses"] or 0
+            r["win_rate"] = (w / (w + l)) if (w + l) else None
         return jsonify(rows)
 
     @app.get("/api/trades")

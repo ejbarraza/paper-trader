@@ -72,6 +72,74 @@ class MarketDataFeed(ABC):
     def latest_quote(self, symbol: str) -> Optional[Quote]:
         """Best current quote, or None when unavailable."""
 
+    def settlements(self, symbols: list[str], today: date) -> list[tuple[str, float]]:
+        """(symbol, payout_per_share) for held positions whose market has
+        resolved. Empty by default; prediction-market feeds override it so
+        the engine can cash out expired markets."""
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Gamma resolution helper (shared by the prediction feeds)
+# ---------------------------------------------------------------------------
+
+# slug -> (payout_or_None, checked_today); decisive payouts stick permanently
+# (checked_today = date.max), undecided ones are re-checked when `today`
+# advances -- a market can resolve months after a backtest's early steps.
+_gamma_payout_cache: dict[str, tuple[Optional[float], date]] = {}
+
+
+def _parse_payout(market: dict, today: date) -> Optional[float]:
+    """1.0 if the market resolved Yes, 0.0 if No, None if not (yet) decisive.
+
+    Pure function of a Gamma market dict -- unit-testable without network.
+    A payout is reported only for *expired* markets with decisive
+    outcomePrices; anything ambiguous is left marked at last price.
+    """
+    try:
+        end_raw = market.get("endDate")
+        end_d = None
+        if end_raw:
+            end_d = datetime.fromisoformat(
+                str(end_raw).replace("Z", "+00:00")).date()
+        if end_d is not None and end_d >= today:
+            return None
+        prices = json.loads(market.get("outcomePrices") or "[]")
+        y, n = float(prices[0]), float(prices[1])
+    except (TypeError, ValueError, IndexError):
+        return None
+    if y > 0.999 and n < 0.001:
+        return 1.0
+    if n > 0.999 and y < 0.001:
+        return 0.0
+    return None
+
+
+def gamma_yes_payout(slug: str, today: date) -> Optional[float]:
+    """Decisive Yes-token payout for a market slug, or None.
+
+    Cached per (slug, today): decisive resolutions stick permanently,
+    ambiguous ones are re-fetched when `today` moves (resolution can land
+    long after expiry).
+    """
+    hit = _gamma_payout_cache.get(slug)
+    if hit is not None:
+        payout, checked = hit
+        if payout is not None or checked == today:
+            return payout
+    try:
+        import requests
+        r = requests.get("https://gamma-api.polymarket.com/markets",
+                         params={"slug": slug}, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        payout = _parse_payout(data[0], today) if data else None
+        _gamma_payout_cache[slug] = (
+            payout, date.max if payout is not None else today)
+        return payout
+    except Exception:
+        return None
+
 
 class YahooFeed(MarketDataFeed):
     """US equities (and anything else Yahoo covers) via yfinance. Free, no key."""
@@ -191,6 +259,18 @@ class PolymarketFeed(MarketDataFeed):
             except (KeyError, ValueError, TypeError):
                 continue
         return sorted(bars, key=lambda b: b.ts)
+
+    def settlements(self, symbols: list[str], today: date) -> list[tuple[str, float]]:
+        out: list[tuple[str, float]] = []
+        for s in symbols:
+            slug, _, side = s.partition(":")
+            payout = gamma_yes_payout(slug, today)
+            if payout is None:
+                continue
+            if side.strip().upper() == "NO":
+                payout = 1.0 - payout
+            out.append((s, payout))
+        return out
 
 
 class PolymarketUSFeed(MarketDataFeed):
@@ -689,6 +769,19 @@ class PolymarketWSFeed(MarketDataFeed):
     def history(self, symbol: str, start: date, end: date) -> list[Bar]:
         return []  # live-only; record with collect_ticks(), backtest via CSV
 
+    def settlements(self, symbols: list[str], today: date) -> list[tuple[str, float]]:
+        # Same Gamma resolution source as PolymarketFeed; ":NO" suffix flips.
+        out: list[tuple[str, float]] = []
+        for s in symbols:
+            slug, _, side = s.partition(":")
+            payout = gamma_yes_payout(slug, today)
+            if payout is None:
+                continue
+            if side.strip().upper() == "NO":
+                payout = 1.0 - payout
+            out.append((s, payout))
+        return out
+
     # -- tick recording -------------------------------------------------------
     def collect_ticks(self, symbols: list, seconds: float,
                      out_csv: str) -> tuple:
@@ -731,7 +824,9 @@ class CsvFeed(MarketDataFeed):
     """Bars from ``<SYMBOL>.csv`` files: ts,symbol,open,high,low,close,volume.
 
     The backtesting workhorse -- deterministic, offline, and the easiest way
-    to feed the engine synthetic or recorded data.
+    to feed the engine synthetic or recorded data. Files may carry optional
+    ``bid``/``ask`` columns (as written by ``resample.py``); when present the
+    engine's fills cross that spread exactly like live quotes.
     """
 
     name = "csv"
@@ -743,6 +838,13 @@ class CsvFeed(MarketDataFeed):
     def _path(self, symbol: str) -> str:
         import os
         return os.path.join(self.directory, f"{symbol}.csv")
+
+    @staticmethod
+    def _opt_float(row: dict, key: str) -> Optional[float]:
+        try:
+            return float(row[key])
+        except (KeyError, TypeError, ValueError):
+            return None
 
     def history(self, symbol: str, start: date, end: date) -> list[Bar]:
         bars: list[Bar] = []
@@ -757,6 +859,8 @@ class CsvFeed(MarketDataFeed):
                         open=float(row["open"]), high=float(row["high"]),
                         low=float(row["low"]), close=float(row["close"]),
                         volume=float(row.get("volume", 0.0)),
+                        bid=self._opt_float(row, "bid"),
+                        ask=self._opt_float(row, "ask"),
                     ))
         except (FileNotFoundError, KeyError, ValueError):
             return []

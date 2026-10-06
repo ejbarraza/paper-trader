@@ -21,7 +21,7 @@ import math
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Optional
 
 from feeds import Bar
@@ -264,10 +264,92 @@ class MeanReversionStrategy(Strategy):
         return []
 
 
+# --------------------------------------------------------------------------
+# 4. Endgame sweep -- the classic prediction-market edge, mechanical leg
+# --------------------------------------------------------------------------
+
+class EndgameSweepStrategy(Strategy):
+    """Buy near-certain outcomes for pennies in a market's final window.
+
+    In the last ``endgame_minutes`` before a market's endDate, if the ask is
+    at or below ``max_price`` (default 5c), buy ``size_usd`` worth and hold
+    to resolution -- the engine settles via the feed's ``settlements()``.
+
+    This is the *mechanical* leg of the classic endgame trade. The real edge
+    comes from knowing the outcome is already decided (news/oracle), which is
+    NOT modeled here. Paper P&L therefore includes markets that resolve
+    against the position; the backtest hit-rate is the honest metric.
+    """
+
+    name = "endgame_sweep"
+    asset_classes = frozenset({"predictions"})
+    blurb = "Buys sub-5c outcomes in a market's final window, holds to resolve"
+
+    def __init__(self, symbols: Optional[list] = None,
+                 end_dates: Optional[dict] = None,
+                 endgame_minutes: int = 120, max_price: float = 0.05,
+                 size_usd: float = 100.0):
+        self.symbols = list(symbols or [])
+        self.endgame_minutes = endgame_minutes
+        self.max_price = max_price
+        self.size_usd = size_usd
+        # slug -> naive-UTC end datetime. Injected for tests; otherwise
+        # fetched once from Gamma at construction.
+        self._ends: dict[str, datetime] = dict(end_dates or {})
+        if not self._ends:
+            self._fetch_ends()
+
+    @staticmethod
+    def _to_naive_utc(dt: datetime) -> datetime:
+        if dt.tzinfo is not None:
+            return dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+
+    def _fetch_ends(self) -> None:
+        import requests
+        for s in self.symbols:
+            slug = s.split(":")[0]
+            if slug in self._ends:
+                continue
+            try:
+                r = requests.get("https://gamma-api.polymarket.com/markets",
+                                 params={"slug": slug}, timeout=15)
+                r.raise_for_status()
+                data = r.json()
+                if not data or not data[0].get("endDate"):
+                    continue
+                end = datetime.fromisoformat(
+                    str(data[0]["endDate"]).replace("Z", "+00:00"))
+                self._ends[slug] = self._to_naive_utc(end)
+            except Exception:
+                continue
+
+    def on_bar(self, bar: Bar, ctx: Ctx) -> list[Signal]:
+        slug = bar.symbol.split(":")[0]
+        end = self._ends.get(slug)
+        if end is None:
+            return []
+        now = self._to_naive_utc(bar.ts)
+        mins_left = (end - now).total_seconds() / 60.0
+        if not (0 < mins_left <= self.endgame_minutes):
+            return []
+        if ctx.positions.get(("spot", bar.symbol), 0) != 0:
+            return []  # one endgame position per symbol at a time
+        ask = bar.ask if bar.ask else bar.close
+        if not ask or ask <= 0 or ask > self.max_price:
+            return []
+        qty = math.floor(self.size_usd / ask)
+        if qty <= 0:
+            return []
+        return [Signal(self.name, bar.symbol, "buy", qty,
+                       note=f"endgame: {mins_left:.0f}m to end, ask={ask:.4f}")]
+
+
 STRATEGY_INFO: dict[str, dict] = {
     "vrp": {"class": VrpPutSellingStrategy},
     "momentum": {"class": MomentumStrategy},
     "meanrev": {"class": MeanReversionStrategy},
+    "endgame": {"class": EndgameSweepStrategy},
 }
 
 
