@@ -159,6 +159,14 @@ class YahooFeed(MarketDataFeed):
             return []
         if df is None or df.empty:
             return []
+        # yfinance >= 1.x returns MultiIndex columns (field, ticker) even for
+        # a single-ticker download; flatten so row["Open"] etc. resolve.
+        try:
+            import pandas as pd
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+        except Exception:
+            pass
         bars: list[Bar] = []
         for ts, row in df.iterrows():
             try:

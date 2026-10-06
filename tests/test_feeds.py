@@ -5,7 +5,7 @@ from datetime import datetime
 
 import pytest
 
-from feeds import Bar, CsvFeed, PolymarketWSFeed, build_feed
+from feeds import Bar, CsvFeed, PolymarketWSFeed, YahooFeed, build_feed
 
 
 def _write_csv(path, symbol, closes):
@@ -96,3 +96,23 @@ def test_ws_history_is_empty():
     feed = PolymarketWSFeed()
     from datetime import date
     assert feed.history("MKT", date(2024, 1, 1), date(2024, 1, 2)) == []
+
+
+def test_yahoo_feed_flattens_multiindex_columns(monkeypatch):
+    """yfinance >= 1.x returns (field, ticker) MultiIndex columns; the feed
+    must flatten them instead of silently dropping every row."""
+    yf = pytest.importorskip("yfinance")
+    import pandas as pd
+
+    cols = pd.MultiIndex.from_product(
+        [["Open", "High", "Low", "Close", "Volume"], ["SPY"]])
+    df = pd.DataFrame(
+        [[1.0, 1.1, 0.9, 1.05, 1000.0],
+         [1.05, 1.15, 1.0, 1.1, 1200.0]],
+        index=pd.to_datetime(["2024-01-02", "2024-01-03"]),
+        columns=cols)
+    monkeypatch.setattr(yf, "download", lambda *a, **k: df)
+    from datetime import date
+    bars = YahooFeed().history("SPY", date(2024, 1, 1), date(2024, 12, 31))
+    assert [b.close for b in bars] == [1.05, 1.1]
+    assert bars[0].open == 1.0 and bars[0].volume == 1000.0
