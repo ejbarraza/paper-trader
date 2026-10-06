@@ -70,8 +70,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--csv-asset-class", default="stocks",
                     choices=["stocks", "options", "predictions"],
                     help="what the CSV files contain")
-    ap.add_argument("--strategies", default="momentum,meanrev",
-                    help="comma-separated: vrp,momentum,meanrev,endgame")
+    ap.add_argument("--strategies", default="",
+                    help="comma-separated strategy names; nothing runs unless "
+                         "named here (see --list-strategies)")
     ap.add_argument("--scanner-dir", default="../options_scanner/outputs",
                     help="options-scanner outputs dir (vrp strategy)")
     ap.add_argument("--capital", type=float, default=100_000.0)
@@ -122,6 +123,45 @@ def parse_args() -> argparse.Namespace:
     return ap.parse_args()
 
 
+def resolve_strategies(args, symbols):
+    """Build the strategy list from --strategies. Nothing is ever added
+    implicitly: every strategy must be named, and --pie alone does not
+    enable the pie strategy."""
+    strats = []
+    specs = [s.strip() for s in args.strategies.split(",") if s.strip()]
+    for spec in specs:
+        if spec == "pie":
+            if not args.pie:
+                raise SystemExit(
+                    "error: --strategies pie needs a --pie allocation "
+                    "(JSON file or 'AAPL:30,MSFT:30,VTI:40')")
+            strats.append(parse_pie(args.pie, args.capital))
+            continue
+        if spec in ("vrp", "tail", "longvol"):
+            kw = {"scanner_dir": args.scanner_dir}
+        elif spec == "endgame":
+            kw = {"symbols": symbols}
+        else:
+            kw = {}
+        strats.append(build_strategy(spec, **kw))
+    if args.pie and "pie" not in specs:
+        raise SystemExit(
+            "error: --pie given but 'pie' is not in --strategies; "
+            "add it explicitly to run the pie")
+    for s in strats:
+        if isinstance(s, PieStrategy):
+            missing = [sym for sym in s.allocations if sym not in
+                       {x.upper() for x in symbols}]
+            if missing:
+                print(f"[pie] warning: no bars for {missing} "
+                      f"-- add them to --symbols")
+    if not strats:
+        raise SystemExit(
+            "error: no strategies selected -- pass --strategies "
+            "(see --list-strategies)")
+    return strats
+
+
 def main() -> None:
     args = parse_args()
     if args.list_strategies:
@@ -165,32 +205,7 @@ def main() -> None:
         print(f"recorded {n} ticks -> {path}")
         return
 
-    strats = []
-    specs = [s.strip() for s in args.strategies.split(",") if s.strip()]
-    for spec in specs:
-        if spec == "pie":
-            if not args.pie:
-                raise SystemExit(
-                    "error: --strategies pie needs a --pie allocation "
-                    "(JSON file or 'AAPL:30,MSFT:30,VTI:40')")
-            strats.append(parse_pie(args.pie, args.capital))
-            continue
-        if spec in ("vrp", "tail", "longvol"):
-            kw = {"scanner_dir": args.scanner_dir}
-        elif spec == "endgame":
-            kw = {"symbols": symbols}
-        else:
-            kw = {}
-        strats.append(build_strategy(spec, **kw))
-    if args.pie and "pie" not in specs:
-        strats.append(parse_pie(args.pie, args.capital))
-    for s in strats:
-        if isinstance(s, PieStrategy):
-            missing = [sym for sym in s.allocations if sym not in
-                       {x.upper() for x in symbols}]
-            if missing:
-                print(f"[pie] warning: no bars for {missing} "
-                      f"-- add them to --symbols")
+    strats = resolve_strategies(args, symbols)
     print(f"feed={feed.name} symbols={symbols} "
           f"strategies={[s.name for s in strats]}")
 
