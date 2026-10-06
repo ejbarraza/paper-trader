@@ -27,6 +27,8 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import json
+import os
 from datetime import date
 
 from dashboard import create_app
@@ -34,7 +36,27 @@ from engine import PaperEngine
 from feeds import build_feed
 from ledger import Ledger
 from risk import RiskArbiter, RiskConfig
-from strategies import build_strategy, describe_strategies
+from strategies import PieStrategy, build_strategy, describe_strategies
+
+
+def parse_pie(spec: str, capital: float) -> PieStrategy:
+    """Build a PieStrategy from a JSON file or an inline 'SYM:pct,...' spec.
+    File format: {"label": ..., "capital": ..., "allocations": {"AAPL": 30}}.
+    Weights are normalized, so percentages or fractions both work."""
+    if os.path.isfile(spec):
+        with open(spec) as f:
+            data = json.load(f)
+        allocs = data["allocations"]
+        label = data.get("label",
+                         os.path.basename(spec).removesuffix(".json"))
+        cap = float(data.get("capital", capital))
+    else:
+        allocs = {}
+        for part in spec.split(","):
+            sym, pct = part.split(":")
+            allocs[sym.strip().upper()] = float(pct)
+        label, cap = "pie", capital
+    return PieStrategy(allocs, capital=cap, label=label)
 
 
 def parse_args() -> argparse.Namespace:
@@ -59,9 +81,16 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--slippage-bps", type=float, default=5.0)
     ap.add_argument("--max-drawdown", type=float, default=0.15)
     ap.add_argument("--daily-loss-limit", type=float, default=0.03)
+    ap.add_argument("--max-exposure", type=float, default=0.80,
+                    help="max portfolio exposure as a fraction of equity "
+                         "(raise toward 1.0 for a fully-invested pie)")
     ap.add_argument("--dashboard", action="store_true",
                     help="serve the dashboard after the run")
     ap.add_argument("--port", type=int, default=5000)
+    ap.add_argument("--pie", default=None,
+                    help="benchmark pie: path to a JSON pie file or inline "
+                         "'AAPL:30,MSFT:30,VTI:40' (percentages). Appends a "
+                         "buy-and-hold PieStrategy sized to --capital.")
     ap.add_argument("--list-strategies", action="store_true",
                     help="show registered strategies and their asset classes")
     ap.add_argument("--discover", action="store_true",
@@ -137,7 +166,15 @@ def main() -> None:
         return
 
     strats = []
-    for spec in [s.strip() for s in args.strategies.split(",") if s.strip()]:
+    specs = [s.strip() for s in args.strategies.split(",") if s.strip()]
+    for spec in specs:
+        if spec == "pie":
+            if not args.pie:
+                raise SystemExit(
+                    "error: --strategies pie needs a --pie allocation "
+                    "(JSON file or 'AAPL:30,MSFT:30,VTI:40')")
+            strats.append(parse_pie(args.pie, args.capital))
+            continue
         if spec in ("vrp", "tail", "longvol"):
             kw = {"scanner_dir": args.scanner_dir}
         elif spec == "endgame":
@@ -145,12 +182,22 @@ def main() -> None:
         else:
             kw = {}
         strats.append(build_strategy(spec, **kw))
+    if args.pie and "pie" not in specs:
+        strats.append(parse_pie(args.pie, args.capital))
+    for s in strats:
+        if isinstance(s, PieStrategy):
+            missing = [sym for sym in s.allocations if sym not in
+                       {x.upper() for x in symbols}]
+            if missing:
+                print(f"[pie] warning: no bars for {missing} "
+                      f"-- add them to --symbols")
     print(f"feed={feed.name} symbols={symbols} "
           f"strategies={[s.name for s in strats]}")
 
     arbiter = RiskArbiter(RiskConfig(
         max_drawdown_frac=args.max_drawdown,
-        daily_loss_limit_frac=args.daily_loss_limit))
+        daily_loss_limit_frac=args.daily_loss_limit,
+        max_portfolio_exposure_frac=args.max_exposure))
     ledger = Ledger(args.db)
     engine = PaperEngine(feed, strats, arbiter, ledger,
                          capital=args.capital,

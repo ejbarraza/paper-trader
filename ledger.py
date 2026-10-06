@@ -107,8 +107,22 @@ class Ledger:
         at the strike (exactly what the engine records).
 
         Realized P&L is in dollars throughout (option lots are scaled by
-        100x -- contracts x per-share points).
+        100x -- contracts x per-share points). ``expectancy`` is mean
+        realized P&L per closed round trip; ``profit_factor`` is gross
+        wins / gross losses.
         """
+        stats, _ = self._fifo_walk()
+        return stats
+
+    def realized_series(self) -> list[dict]:
+        """Cumulative realized P&L per strategy after each trade, in time
+        order: [{"ts", "strategy", "realized"}]. A step function over
+        closed trades only -- the raw material for judging edge. Open
+        positions contribute nothing until they close."""
+        _, series = self._fifo_walk(collect_series=True)
+        return series
+
+    def _fifo_walk(self, collect_series: bool = False):
         trades = self._all("SELECT * FROM trades ORDER BY id")
         # (strategy, symbol) -> list of [qty, price]; qty<0 means short/open put
         spot_lots: dict[tuple, list] = {}
@@ -120,7 +134,8 @@ class Ledger:
         def st(s):
             return stats.setdefault(s, {"strategy": s, "net": 0.0,
                                         "n_trades": 0, "wins": 0, "losses": 0,
-                                        "realized": 0.0})
+                                        "realized": 0.0,
+                                        "gross_win": 0.0, "gross_loss": 0.0})
 
         def match(lots, key, qty, price, pnl_sign):
             """Close `qty` against FIFO lots; returns realized P&L."""
@@ -137,6 +152,7 @@ class Ledger:
                     book[0][0] = lq - m * (1 if lq > 0 else -1)
             return realized, qty
 
+        series: list[dict] = []
         for t in trades:
             s, sym, a = t["strategy"], t["symbol"], t["action"]
             q, px, cd = t["qty"], t["price"], t["cash_delta"]
@@ -144,8 +160,7 @@ class Ledger:
             row["net"] += cd
             row["n_trades"] += 1
             key = (s, sym)
-            if a == "buy":
-                # cover shorts first, then open long
+            if a == "buy":                # cover shorts first, then open long
                 realized, rem = match(spot_lots, key, q, px, +1)
                 row["realized"] += realized
                 self._bump_wl(row, realized)
@@ -203,12 +218,18 @@ class Ledger:
                     realized = lq * (px - lp) * 100.0
                     row["realized"] += realized
                     self._bump_wl(row, realized)
+            if collect_series:
+                series.append({"ts": t["ts"], "strategy": s,
+                               "realized": round(row["realized"], 2)})
         out = []
         for r in stats.values():
             w, l = r["wins"], r["losses"]
             r["win_rate"] = (w / (w + l)) if (w + l) else None
+            r["expectancy"] = (r["realized"] / (w + l)) if (w + l) else None
+            gl = r["gross_loss"]
+            r["profit_factor"] = (r["gross_win"] / -gl) if gl < -1e-9 else None
             out.append(r)
-        return sorted(out, key=lambda r: r["net"], reverse=True)
+        return sorted(out, key=lambda r: r["net"], reverse=True), series
 
     @staticmethod
     def _bump_wl(row: dict, realized: float) -> None:
@@ -216,8 +237,10 @@ class Ledger:
             return
         if realized > 0:
             row["wins"] += 1
+            row["gross_win"] += realized
         else:
             row["losses"] += 1
+            row["gross_loss"] += realized
 
     def portfolio_summary(self) -> dict:
         """Equity, return, and max drawdown from the equity curve."""

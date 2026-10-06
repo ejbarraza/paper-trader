@@ -687,10 +687,48 @@ class LongVolStrategy(Strategy):
         return out
 
 
+class PieStrategy(Strategy):
+    """Buy-and-hold benchmark pie (M1-style): on the first bar for each
+    symbol in the allocation, buys ``floor(capital * weight / price)``
+    shares and holds. No rebalancing, no exits -- it is the passive
+    benchmark the active strategies are judged against.
+
+    Run it as the whole account and the equity curve is the pie's balance
+    over time; run two ledgers (pie vs active) and overlay them with
+    ``dashboard.py --compare``.
+    """
+
+    name = "pie"
+    asset_classes = frozenset({"stocks"})
+    blurb = "buy-and-hold allocation pie (benchmark)"
+
+    def __init__(self, allocations: dict[str, float],
+                 capital: float = 10_000.0, label: str = "pie"):
+        total = sum(allocations.values()) or 1.0
+        self.allocations = {s.upper(): w / total
+                            for s, w in allocations.items()}
+        self.capital = capital
+        self.name = label  # instance label; class name stays "pie"
+        self._bought: set[str] = set()
+
+    def on_bar(self, bar: Bar, ctx: Ctx) -> list[Signal]:
+        sym = bar.symbol.upper()
+        if sym in self._bought or sym not in self.allocations:
+            return []
+        self._bought.add(sym)
+        w = self.allocations[sym]
+        qty = math.floor(self.capital * w / bar.close) if bar.close > 0 else 0
+        if qty < 1:
+            return []
+        return [Signal(self.name, bar.symbol, "buy", qty,
+                       note=f"pie '{self.name}': {w * 100:.1f}% x {qty}")]
+
+
 STRATEGY_INFO: dict[str, dict] = {
     "vrp": {"class": VrpPutSellingStrategy},
     "tail": {"class": TailHedgeStrategy},
     "longvol": {"class": LongVolStrategy},
+    "pie": {"class": PieStrategy},
     "momentum": {"class": MomentumStrategy},
     "meanrev": {"class": MeanReversionStrategy},
     "endgame": {"class": EndgameSweepStrategy},

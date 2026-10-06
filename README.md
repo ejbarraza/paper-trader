@@ -47,7 +47,8 @@ hold keys, or touch a wallet. That is deliberate, not a missing feature.
   (cash, equity, positions, recent closes) and emits signals. Strategies know
   nothing about risk; that separation is the point. Every strategy declares
   the asset classes it can trade (`vrp`/`tail`/`longvol` → options;
-  `momentum`/`meanrev` → stocks + predictions), and the engine refuses to
+  `momentum`/`meanrev` → stocks + predictions; `pie` → stocks), and the
+  engine refuses to
   run a strategy on a feed it doesn't understand — loudly, never silently.
   - `vrp` **[options]** — sells the top-VRP cash-secured puts from the
     [options-scanner](https://github.com/ejbarraza/Options-Scanner) output,
@@ -87,8 +88,19 @@ hold keys, or touch a wallet. That is deliberate, not a missing feature.
   simulates fills with slippage and fees (live fills cross the real
   bid/ask), marks to market, writes the ledger. Both modes share one
   `_step()` so backtest and live can't drift apart.
+  - `pie` **[stocks]** — buy-and-hold benchmark pie (M1-style): on the first
+    bar for each symbol in the allocation, buys `floor(capital × weight /
+    price)` shares and holds. No rebalancing, no exits. Give it an
+    allocation with `--pie "AAPL:30,MSFT:30,VTI:40"` or `--pie pies/tech-leaders.json`
+    (see `pies/` for samples); it is sized to `--capital`. Run it as the whole
+    account and the equity curve is the pie's balance over time.
 - **Dashboard** (`dashboard.py`) — read-only Flask app: equity curve,
-  positions, per-strategy P&L, trade tape, and the risk-event log.
+  positions, per-strategy P&L, trade tape, and the risk-event log. The
+  **Edge** panel charts each strategy's cumulative *realized* P&L (closed
+  trades only) with expectancy per trade and profit factor — the honest
+  answer to "do I have edge". `dashboard.py --compare other.db` overlays a
+  second account's equity curve (indexed to 100), e.g. a buy-and-hold pie
+  benchmark against your active strategies.
 
 ## Quickstart
 
