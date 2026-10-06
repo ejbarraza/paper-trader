@@ -44,6 +44,7 @@ section{margin-bottom:28px}h2{font-size:16px;margin-bottom:8px}
 <section><h2>Open positions</h2><table id="pos"><tr><th>Position</th><th>Qty</th><th>Mark</th><th>Value</th></tr></table></section>
 <section><h2>Strategy P&amp;L</h2><table id="strat"><tr><th>Strategy</th><th>Trades</th><th>Win rate</th><th>Net P&amp;L</th></tr></table></section>
 <section><h2>Recent trades</h2><table id="trades"><tr><th>Time</th><th>Strategy</th><th>Symbol</th><th>Action</th><th>Qty</th><th>Price</th><th>Cash Δ</th><th>Note</th></tr></table></section>
+<section><h2>Arbiter rejections <span style="color:#8b949e;font-weight:normal">(blocked orders by reason)</span></h2><table id="rej"><tr><th>Reason</th><th>Count</th><th>Top strategy</th></tr></table></section>
 <section><h2>Risk events <span style="color:#8b949e;font-weight:normal">(orders the arbiter blocked)</span></h2><table id="risk"><tr><th>Time</th><th>Strategy</th><th>Symbol</th><th>Action</th><th>Reason</th></tr></table></section>
 <script>
 const DATA=__DATA__;
@@ -103,6 +104,12 @@ function row(t,cells){const tr=document.createElement('tr');cells.forEach(c=>{co
  DATA.edge_stats.forEach(s=>row(document.getElementById('strat'),[s.strategy,s.n_trades,s.win_rate==null?'—':(s.win_rate*100).toFixed(0)+'%',`<span class="${s.net>=0?'up':'down'}">${fmt$(s.net)}</span>`]));
  DATA.trades.slice(0,50).forEach(t=>row(document.getElementById('trades'),[String(t.ts).slice(0,16),t.strategy,t.symbol,t.action,t.qty,fmt$(t.price),fmt$(t.cash_delta),String(t.note||'').slice(0,60)]));
  DATA.risk.slice(0,50).forEach(r=>row(document.getElementById('risk'),[String(r.ts).slice(0,16),r.strategy,r.symbol,r.action,`<span class="pill">${r.reason}</span>`]));
+ const rej=DATA.rejections;
+ Object.entries(rej.by_reason).sort((a,b)=>b[1]-a[1]).forEach(([reason,n])=>{
+   const top=(rej.by_strategy_reason.find(r=>r.reason===reason)||{}).strategy||'—';
+   row(document.getElementById('rej'),[`<span class="pill">${reason}</span>`,n,top]);
+ });
+ if(!rej.total) row(document.getElementById('rej'),['<span style="color:#8b949e">no rejections recorded</span>','','']);
 })();
 </script></body></html>
 """
@@ -119,6 +126,7 @@ def build(db_path: str, compare_db: str | None = None) -> str:
         "positions": led.latest_positions(),
         "trades": led.trades(limit=200),
         "risk": led.risk_events(limit=200),
+        "rejections": led.rejection_summary(),
         "summary": led.portfolio_summary(),
     }
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")

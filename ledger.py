@@ -32,6 +32,8 @@ class Ledger:
                 ts TEXT NOT NULL, pkey TEXT NOT NULL, qty REAL NOT NULL,
                 mark REAL NOT NULL,
                 PRIMARY KEY (ts, pkey));
+            CREATE TABLE IF NOT EXISTS snapshots(
+                ts TEXT PRIMARY KEY);
         """)
         self._db.commit()
 
@@ -61,12 +63,16 @@ class Ledger:
         self._db.commit()
 
     def snapshot_positions(self, ts: datetime, marks: dict[str, tuple[float, float]]) -> None:
-        """marks: pkey -> (qty, mark_price)."""
+        """marks: pkey -> (qty, mark_price). The ts is recorded even when
+        marks is empty, so latest_positions() knows the account went
+        flat instead of showing the previous non-empty snapshot."""
         iso = ts.isoformat()
         self._db.execute("DELETE FROM positions WHERE ts=?", (iso,))
         self._db.executemany(
             "INSERT INTO positions(ts,pkey,qty,mark) VALUES (?,?,?,?)",
             [(iso, k, q, m) for k, (q, m) in marks.items()])
+        self._db.execute("INSERT OR IGNORE INTO snapshots(ts) VALUES (?)",
+                         (iso,))
         self._db.commit()
 
     # -- reads (dashboard) ----------------------------------------------
@@ -83,9 +89,19 @@ class Ledger:
         return self._all("SELECT * FROM risk_events ORDER BY ts DESC LIMIT ?", (limit,))
 
     def latest_positions(self) -> list[dict]:
-        return self._all("""
-            SELECT pkey,qty,mark FROM positions
-            WHERE ts = (SELECT MAX(ts) FROM positions)""")
+        snap = self._all(
+            "SELECT ts FROM snapshots ORDER BY ts DESC LIMIT 1")
+        if snap:
+            latest_ts = snap[0]["ts"]
+        else:
+            # DBs written before the snapshots table existed.
+            legacy = self._all("SELECT MAX(ts) AS ts FROM positions")
+            latest_ts = legacy[0]["ts"] if legacy else None
+        if not latest_ts:
+            return []
+        return self._all(
+            "SELECT pkey,qty,mark FROM positions WHERE ts=?",
+            (latest_ts,))
 
     def strategy_pnl(self) -> list[dict]:
         return self._all("""
@@ -111,7 +127,7 @@ class Ledger:
         realized P&L per closed round trip; ``profit_factor`` is gross
         wins / gross losses.
         """
-        stats, _ = self._fifo_walk()
+        stats, _, _ = self._fifo_walk()
         return stats
 
     def realized_series(self) -> list[dict]:
@@ -119,7 +135,7 @@ class Ledger:
         order: [{"ts", "strategy", "realized"}]. A step function over
         closed trades only -- the raw material for judging edge. Open
         positions contribute nothing until they close."""
-        _, series = self._fifo_walk(collect_series=True)
+        _, series, _ = self._fifo_walk(collect_series=True)
         return series
 
     def _fifo_walk(self, collect_series: bool = False):
@@ -229,7 +245,37 @@ class Ledger:
             gl = r["gross_loss"]
             r["profit_factor"] = (r["gross_win"] / -gl) if gl < -1e-9 else None
             out.append(r)
-        return sorted(out, key=lambda r: r["net"], reverse=True), series
+        # Net open qty per (book, strategy, symbol), for the audit harness.
+        # Books: spot (signed shares), put (short puts; positive = open
+        # short), long_put / long_call (positive = open long).
+        open_lots: dict[tuple, float] = {}
+        for book_name, book in (("spot", spot_lots), ("put", put_lots),
+                                ("long_put", long_put_lots),
+                                ("long_call", long_call_lots)):
+            for (s, sym), lots in book.items():
+                net = sum(lq for lq, _ in lots)
+                if abs(net) > 1e-9:
+                    open_lots[(book_name, s, sym)] = net
+        return (sorted(out, key=lambda r: r["net"], reverse=True),
+                series, open_lots)
+
+    def implied_open_qty(self) -> dict[tuple, float]:
+        """Net open qty per (book, strategy, symbol) implied by the trade
+        tape. See _fifo_walk for book conventions."""
+        _, _, lots = self._fifo_walk()
+        return lots
+
+    def rejection_summary(self) -> dict:
+        """Aggregate arbiter rejections: total, by reason, by strategy."""
+        rows = self._all(
+            "SELECT reason, strategy, COUNT(*) AS n FROM risk_events "
+            "GROUP BY reason, strategy ORDER BY n DESC")
+        by_reason: dict[str, int] = {}
+        for r in rows:
+            by_reason[r["reason"]] = by_reason.get(r["reason"], 0) + r["n"]
+        return {"total": sum(by_reason.values()),
+                "by_reason": by_reason,
+                "by_strategy_reason": rows}
 
     @staticmethod
     def _bump_wl(row: dict, realized: float) -> None:

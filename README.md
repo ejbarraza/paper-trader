@@ -102,9 +102,18 @@ hold keys, or touch a wallet. That is deliberate, not a missing feature.
   positions, per-strategy P&L, trade tape, and the risk-event log. The
   **Edge** panel charts each strategy's cumulative *realized* P&L (closed
   trades only) with expectancy per trade and profit factor — the honest
-  answer to "do I have edge". `dashboard.py --compare other.db` overlays a
+  answer to "do I have edge". The **Arbiter rejections** card aggregates
+  blocked orders by named reason (and top strategy per reason).
+  `dashboard.py --compare other.db` overlays a
   second account's equity curve (indexed to 100), e.g. a buy-and-hold pie
   benchmark against your active strategies.
+- **Audit** (`reconcile.py`) — drift guard for the ledger: walks cash
+  (every cash movement between equity snapshots must equal the trade
+  tape's cash_deltas), decomposes equity (cash + Σ qty×mark at every
+  snapshot), and ties trade-implied open lots to the latest position
+  snapshot. Run standalone (`run.py reconcile --db paper.db`), per-run
+  (`--reconcile` flag, or `"reconcile": true` in a `--book` file) —
+  a failed audit fails the run.
 
 ## Quickstart
 
@@ -221,7 +230,9 @@ engine.py      # PaperEngine: backtest replay + paper-forward live loop,
                #   spread-aware fills, option expiry, prediction settlement
 pricing.py     # Black-Scholes put pricer (option marks)
 ledger.py      # SQLite: trades, equity, risk_events, position snapshots,
-               #   FIFO attribution, portfolio summary
+               #   FIFO attribution, portfolio summary, rejection telemetry
+reconcile.py   # ledger audit harness: cash walk, equity decomposition,
+               #   open-lot tie-out (drift guard)
 dashboard.py   # read-only Flask operator view (health, attribution)
 resample.py    # tick CSV -> OHLC bars for backtesting recordings
 discover.py    # Gamma scan for liquid, order-book-enabled markets

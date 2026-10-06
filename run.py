@@ -6,6 +6,7 @@ Subcommands:
     run.py live          paper-forward: step the engine on live quotes
     run.py dashboard     serve the read-only dashboard
     run.py report        static HTML snapshot of a ledger (no server)
+    run.py reconcile     audit a ledger's invariants (drift guard)
     run.py discover      scan Polymarket for liquid tradeable markets
     run.py resample      ticks.csv -> OHLC bars
     run.py collect       record live Polymarket websocket ticks
@@ -219,6 +220,10 @@ def _add_run_args(p):
     p.add_argument("--max-exposure", type=float, default=0.80,
                    help="max portfolio exposure as a fraction of equity "
                         "(use ~1.0 for a fully-invested pie)")
+    p.add_argument("--reconcile", action="store_true",
+                   help="audit the ledger at end of run (cash walk, equity "
+                        "decomposition, open-lot tie-out); fails the run "
+                        "on drift. Also available as a --book key.")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -254,6 +259,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--db", required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--compare", default=None)
+
+    sub.add_parser("reconcile",
+                   help="audit a ledger's invariants").add_argument(
+                       "--db", required=True)
 
     p = sub.add_parser("discover",
                        help="scan Polymarket for liquid tradeable markets")
@@ -392,6 +401,15 @@ def cmd_report(args) -> None:
     print(f"wrote {args.out} ({len(html) // 1024} KB)")
 
 
+def cmd_reconcile(args) -> None:
+    from reconcile import audit
+    print(f"reconciling {args.db}")
+    ok = audit(args.db)
+    print("RECONCILE:", "PASS" if ok else "FAIL")
+    if not ok:
+        raise SystemExit(1)
+
+
 def _pick(label: str, options: list[str], default: str) -> str:
     print(f"{label}:")
     for i, o in enumerate(options, 1):
@@ -472,6 +490,8 @@ def main(argv=None) -> None:
         cmd_dashboard(args)
     elif cmd == "report":
         cmd_report(args)
+    elif cmd == "reconcile":
+        cmd_reconcile(args)
     elif cmd == "interactive":
         cmd_interactive()
     elif cmd in ("backtest", "live"):
@@ -481,6 +501,13 @@ def main(argv=None) -> None:
             run_backtest(args, symbols)
         else:
             run_live(args, symbols)
+        if args.reconcile:
+            from reconcile import audit
+            print(f"reconciling {args.db}")
+            ok = audit(args.db)
+            print("RECONCILE:", "PASS" if ok else "FAIL")
+            if not ok:
+                raise SystemExit(1)
 
 
 if __name__ == "__main__":
