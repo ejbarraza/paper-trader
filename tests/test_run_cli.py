@@ -12,7 +12,7 @@ from strategies import PieStrategy
 
 def _args(**kw):
     base = dict(strategies="", pie=None, capital=10_000,
-                scanner_dir="/tmp/nope")
+                scanner_dir="/tmp/nope", feed="yahoo")
     base.update(kw)
     return SimpleNamespace(**base)
 
@@ -22,9 +22,52 @@ def test_strategies_default_is_empty():
     assert args.strategies == ""
 
 
-def test_no_strategies_is_an_error():
+def test_no_strategies_is_an_error_without_default():
     with pytest.raises(SystemExit, match="no strategies selected"):
         resolve_strategies(_args(), ["AAPL"])
+
+
+def test_default_spy_when_nothing_selected():
+    args = _args()
+    args.default_spy = True
+    strats = resolve_strategies(args, ["AAPL", "SPY"])
+    assert len(strats) == 1
+    assert strats[0].allocations == {"SPY": 1.0}
+    assert strats[0].name == "spy-default"
+
+
+def test_ensure_default_position_adds_spy():
+    from run import ensure_default_position
+    args = _args()
+    args.feed = "yahoo"
+    syms = ensure_default_position(args, ["AAPL"])
+    assert syms == ["AAPL", "SPY"]
+    assert args.default_spy is True
+
+
+def test_ensure_default_position_no_duplicate_spy():
+    from run import ensure_default_position
+    args = _args()
+    args.feed = "yahoo"
+    syms = ensure_default_position(args, ["SPY"])
+    assert syms == ["SPY"]
+
+
+def test_ensure_default_position_keeps_explicit_choice():
+    from run import ensure_default_position
+    args = _args(strategies="momentum")
+    args.feed = "yahoo"
+    syms = ensure_default_position(args, ["AAPL"])
+    assert syms == ["AAPL"]
+    assert getattr(args, "default_spy", False) is False
+
+
+def test_ensure_default_position_errors_off_stock_feeds():
+    from run import ensure_default_position
+    args = _args()
+    args.feed = "polymarket_ws"
+    with pytest.raises(SystemExit, match="no default position"):
+        ensure_default_position(args, ["some-slug"])
 
 
 def test_pie_flag_alone_selects_the_pie():

@@ -133,7 +133,11 @@ python3 -m venv .venv
 ./.venv/bin/python run.py strategies
 ```
 
-Strategies are opt-in only — nothing runs unless you name it. Config can
+Strategies are opt-in only — nothing runs unless you name it. The one
+exception is the account's resting state: with nothing selected on a
+stock-capable feed, the engine defaults to buy-and-hold SPY (labeled
+`spy-default`, SPY auto-added to `--symbols`) instead of erroring.
+On feeds where SPY isn't tradeable it stays an error. Config can
 ride with the name (`--strategies "pie:pies/qqq.json,momentum"`), or pass
 `--pie` on its own to run a buy-and-hold pie:
 

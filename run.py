@@ -159,10 +159,33 @@ def resolve_strategies(args, symbols):
                 print(f"[pie] warning: no bars for {missing} "
                       f"-- add them to --symbols")
     if not strats:
+        if getattr(args, "default_spy", False):
+            return [PieStrategy({"SPY": 100.0}, capital=args.capital,
+                                label="spy-default")]
         raise SystemExit(
             "error: no strategies selected -- pass --strategies, "
             "--pie, or --book (see `run.py strategies`)")
     return strats
+
+
+def ensure_default_position(args, symbols: list[str]) -> list[str]:
+    """The account's resting state is long SPY: with nothing selected on a
+    stock-capable feed, default to a buy-and-hold SPY pie (SPY is added to
+    the symbols). On feeds where SPY is not tradeable there is no
+    sensible default, so it stays an error. Returns the symbol list."""
+    if (args.strategies or "").strip() or args.pie:
+        return symbols
+    if args.feed in ("yahoo", "csv"):
+        args.default_spy = True
+        if "SPY" not in {s.upper() for s in symbols}:
+            symbols = symbols + ["SPY"]
+        print("no strategies selected -- defaulting to buy-and-hold SPY "
+              "(pass --strategies to choose)")
+        return symbols
+    raise SystemExit(
+        "error: no strategies selected and no default position exists "
+        f"for the {args.feed} feed -- pass --strategies, --pie, or --book "
+        "(see `run.py strategies`)")
 
 
 def normalize_symbols(raw) -> list[str]:
@@ -463,8 +486,9 @@ def cmd_interactive() -> None:
         end=_prompt("End date", "2024-12-31") if mode == "backtest" else "",
         interval=60.0, duration=0.0, alert_url="", dashboard=False, port=5000)
     syms = normalize_symbols(symbols)
+    syms = ensure_default_position(ns, syms)
     print(f"\nmode={mode} feed={feed} symbols={syms} "
-          f"strategies={specs or 'NONE'} capital={capital} db={db}")
+          f"strategies={specs or 'SPY (default)'} capital={capital} db={db}")
     if _prompt("Run? [Y/n]", "Y").lower().startswith("n"):
         print("cancelled")
         return
@@ -497,6 +521,7 @@ def main(argv=None) -> None:
     elif cmd in ("backtest", "live"):
         args = apply_book(args, parser)
         symbols = normalize_symbols(args.symbols)
+        symbols = ensure_default_position(args, symbols)
         if cmd == "backtest":
             run_backtest(args, symbols)
         else:
