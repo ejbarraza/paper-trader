@@ -14,8 +14,9 @@ The engine has no code path that can touch a live market.
 
 from __future__ import annotations
 
+import time
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from feeds import Bar, MarketDataFeed
@@ -57,6 +58,7 @@ class PaperEngine:
         self.day_start_equity = capital
         self._day: Optional[date] = None
         self.equity = capital
+        self._n_signals = self._n_fills = self._n_rejected = 0
 
     # -- helpers ------------------------------------------------------
     def _spot_qty(self, symbol: str) -> float:
@@ -100,9 +102,14 @@ class PaperEngine:
 
     # -- fills ----------------------------------------------------------
     def _est_fill(self, signal: Signal, bar: Bar) -> float:
-        if signal.action in ("buy", "sell"):
-            return bar.close * (1 + self.slippage if signal.action == "buy"
-                                else 1 - self.slippage)
+        # Live bars carry the real top-of-book: lift the ask on buys, hit
+        # the bid on sells. Historical bars fall back to close +/- slippage.
+        if signal.action == "buy":
+            px = bar.ask if bar.ask else bar.close
+            return px * (1 + self.slippage)
+        if signal.action == "sell":
+            px = bar.bid if bar.bid else bar.close
+            return px * (1 - self.slippage)
         if signal.action == "sell_put":
             px = signal.limit_price or bar.close * 0.05
             return px * (1 - self.slippage)
@@ -195,10 +202,8 @@ class PaperEngine:
                 0.0, self.strategy_exposure.get("vrp_puts", 0.0)
                 - contracts * strike * 100.0)
 
-    # -- main loop ------------------------------------------------------
-    def run(self, symbols: list[str], start: date, end: date) -> dict:
-        # Asset-class gating: a strategy only runs on a feed it understands.
-        # Mismatches are skipped loudly, never silently.
+    def _compatible_strategies(self) -> list[Strategy]:
+        """Strategies this feed can serve; mismatches are skipped loudly."""
         compatible = [s for s in self.strategies
                       if self.feed.asset_class in s.asset_classes]
         for s in self.strategies:
@@ -206,10 +211,94 @@ class PaperEngine:
                 print(f"  [engine] skipping '{s.name}': needs "
                       f"{sorted(s.asset_classes)}, feed '{self.feed.name}' "
                       f"provides '{self.feed.asset_class}'")
-        if not compatible:
+        return compatible
+
+    def _reset_counters(self) -> None:
+        self._n_signals = self._n_fills = self._n_rejected = 0
+
+    def _step(self, ts: datetime, todays: dict[str, Bar],
+              strategies: list[Strategy]) -> None:
+        """One engine step: settle, mark, signal, arbitrate, fill, ledger.
+
+        Shared by backtest replay and the live loop -- the only difference
+        is where the bars come from.
+        """
+        today = ts.date()
+        if self._day != today:
+            self._day = today
+            self.day_start_equity = self.equity
+        for s, b in todays.items():
+            self.latest[s] = b
+            self.closes[s].append(b.close)
+        self._settle_expiries(today, ts)
+
+        marks = self._marks(today)
+        self.equity = self.cash + sum(marks.values())
+        self.peak_equity = max(self.peak_equity, self.equity)
+
+        ctx = Ctx(cash=self.cash, equity=self.equity, today=today,
+                  positions=dict(self.positions),
+                  closes={s: list(c) for s, c in self.closes.items()},
+                  put_details=dict(self.put_details))
+        for strat in strategies:
+            for bar in todays.values():
+                try:
+                    signals = strat.on_bar(bar, ctx) or []
+                except Exception as e:  # a broken strategy never kills the loop
+                    print(f"  [strategy:{strat.name}] error on {bar.symbol}: {e}")
+                    continue
+                for sig in signals:
+                    self._n_signals += 1
+                    if sig.symbol not in todays:
+                        continue
+                    est = self._est_fill(sig, todays[sig.symbol])
+                    state = PortfolioState(
+                        cash=self.cash, equity=self.equity,
+                        peak_equity=self.peak_equity,
+                        day_start_equity=self.day_start_equity,
+                        strategy_exposure=dict(self.strategy_exposure),
+                        symbol_exposure=self._symbol_exposure(today))
+                    ok, reason = self.arbiter.check(sig, est, state)
+                    if not ok:
+                        self._n_rejected += 1
+                        self.ledger.record_risk_event(
+                            ts, sig.strategy, sig.symbol, sig.action, reason)
+                        continue
+                    self._apply_fill(sig, est, ts)
+                    self._n_fills += 1
+                    # refresh marks after the fill for the next signal
+                    marks = self._marks(today)
+                    self.equity = self.cash + sum(marks.values())
+                    self.peak_equity = max(self.peak_equity, self.equity)
+
+        self.ledger.record_equity(ts, self.equity, self.cash)
+        snap = {}
+        for key, qty in self.positions.items():
+            if qty == 0:
+                continue
+            if key[0] == "spot":
+                bar = self.latest.get(key[1])
+                snap[_pkey(key)] = (qty, bar.close if bar else 0.0)
+            else:
+                bar = self.latest.get(key[1])
+                S = bar.close if bar else 0.0
+                snap[_pkey(key)] = (qty, -self._put_mark(key, S, today) * 100.0)
+        self.ledger.snapshot_positions(ts, snap)
+
+    def _summary(self) -> dict:
+        return {"signals": self._n_signals, "fills": self._n_fills,
+                "rejected": self._n_rejected, "final_equity": self.equity,
+                "cash": self.cash,
+                "return_pct": (self.equity / self.capital - 1) * 100}
+
+    # -- main loops -----------------------------------------------------
+    def run(self, symbols: list[str], start: date, end: date) -> dict:
+        """Backtest: replay historical bars."""
+        strategies = self._compatible_strategies()
+        if not strategies:
             return {"error": "no strategy compatible with "
                              f"{self.feed.asset_class} feed"}
-        strategies = compatible
+        self._reset_counters()
 
         histories = {}
         for s in symbols:
@@ -226,71 +315,95 @@ class PaperEngine:
             for b in bars:
                 by_ts[b.ts][s] = b
 
-        n_signals = n_fills = n_rejected = 0
         for ts in timeline:
-            today = ts.date()
-            if self._day != today:
-                self._day = today
-                self.day_start_equity = self.equity
-            todays = by_ts[ts]
-            for s, b in todays.items():
-                self.latest[s] = b
+            self._step(ts, by_ts[ts], strategies)
+        return self._summary()
+
+    def _seed_closes(self, symbols: list[str], lookback_days: int = 400,
+                     max_bars: int = 500) -> None:
+        """Warm the strategies' recent-close series from feed history when
+        the feed has one (Yahoo does; the WS socket doesn't -- those loops
+        simply warm up live)."""
+        end = date.today()
+        start = end - timedelta(days=lookback_days)
+        for s in symbols:
+            try:
+                bars = self.feed.history(s, start, end) or []
+            except Exception:
+                bars = []
+            for b in bars[-max_bars:]:
                 self.closes[s].append(b.close)
-            self._settle_expiries(today, ts)
+            if bars:
+                print(f"  [engine] seeded {len(bars[-max_bars:])} closes for {s}")
 
-            marks = self._marks(today)
-            self.equity = self.cash + sum(marks.values())
-            self.peak_equity = max(self.peak_equity, self.equity)
+    def run_live(self, symbols: list[str], interval_s: float = 60.0,
+                 duration_s: Optional[float] = None) -> dict:
+        """Paper-forward: step the engine on live quotes until stopped.
 
-            ctx = Ctx(cash=self.cash, equity=self.equity, today=today,
-                      positions=dict(self.positions),
-                      closes={s: list(c) for s, c in self.closes.items()},
-                      put_details=dict(self.put_details))
-            for strat in strategies:
-                for bar in todays.values():
+        Every ``interval_s`` seconds each symbol is quoted via
+        ``feed.latest_quote()``; the mid becomes the bar's close with the
+        real bid/ask attached, so fills cross the actual spread. Runs until
+        ``duration_s`` elapses or Ctrl-C. Strategies warm up from feed
+        history when available.
+        """
+        strategies = self._compatible_strategies()
+        if not strategies:
+            return {"error": "no strategy compatible with "
+                             f"{self.feed.asset_class} feed"}
+        self._reset_counters()
+        self._seed_closes(symbols)
+
+        # Warm up: make sure every symbol has a live book before step 1,
+        # so the first round isn't skipped on a slow socket handshake.
+        print("  [live] warming up quotes...")
+        live_symbols = []
+        for s in symbols:
+            q = self.feed.latest_quote(s)
+            if q is None:
+                print(f"  [live] WARNING: no quote for {s} after warm-up; "
+                      f"it will be retried each round")
+                continue
+            live_symbols.append(s)
+            print(f"  [live] {s}: bid={q.bid:.4f} ask={q.ask:.4f}")
+        if not live_symbols:
+            return {"error": "no live quotes for any symbol"}
+        symbols = live_symbols
+
+        t0 = time.time()
+        step = 0
+        print(f"  [live] every {interval_s:g}s; "
+              f"{'for ' + str(duration_s) + 's' if duration_s else 'until Ctrl-C'}")
+        try:
+            while True:
+                if duration_s and time.time() - t0 >= duration_s:
+                    break
+                ts = datetime.now()
+                todays: dict[str, Bar] = {}
+                for s in symbols:
                     try:
-                        signals = strat.on_bar(bar, ctx) or []
-                    except Exception as e:  # a broken strategy never kills the loop
-                        print(f"  [strategy:{strat.name}] error on {bar.symbol}: {e}")
+                        q = self.feed.latest_quote(s)
+                    except Exception as e:
+                        print(f"  [feed] quote error for {s}: {e}")
                         continue
-                    for sig in signals:
-                        n_signals += 1
-                        if sig.symbol not in todays:
-                            continue
-                        est = self._est_fill(sig, todays[sig.symbol])
-                        state = PortfolioState(
-                            cash=self.cash, equity=self.equity,
-                            peak_equity=self.peak_equity,
-                            day_start_equity=self.day_start_equity,
-                            strategy_exposure=dict(self.strategy_exposure),
-                            symbol_exposure=self._symbol_exposure(today))
-                        ok, reason = self.arbiter.check(sig, est, state)
-                        if not ok:
-                            n_rejected += 1
-                            self.ledger.record_risk_event(
-                                ts, sig.strategy, sig.symbol, sig.action, reason)
-                            continue
-                        self._apply_fill(sig, est, ts)
-                        n_fills += 1
-                        # refresh marks after the fill for the next signal
-                        marks = self._marks(today)
-                        self.equity = self.cash + sum(marks.values())
-                        self.peak_equity = max(self.peak_equity, self.equity)
-
-            self.ledger.record_equity(ts, self.equity, self.cash)
-            snap = {}
-            for key, qty in self.positions.items():
-                if qty == 0:
-                    continue
-                if key[0] == "spot":
-                    bar = self.latest.get(key[1])
-                    snap[_pkey(key)] = (qty, bar.close if bar else 0.0)
+                    if q is None:
+                        if step % 10 == 0:
+                            print(f"  [feed] no quote for {s}; skipping")
+                        continue
+                    mid = q.mid
+                    todays[s] = Bar(ts=q.ts, symbol=s, open=mid, high=mid,
+                                    low=mid, close=mid, volume=0.0,
+                                    bid=q.bid, ask=q.ask)
+                if todays:
+                    self._step(ts, todays, strategies)
+                    step += 1
+                    if step % 10 == 0:
+                        print(f"  [live] step {step}: equity=${self.equity:,.2f} "
+                              f"fills={self._n_fills}")
                 else:
-                    bar = self.latest.get(key[1])
-                    S = bar.close if bar else 0.0
-                    snap[_pkey(key)] = (qty, -self._put_mark(key, S, today) * 100.0)
-            self.ledger.snapshot_positions(ts, snap)
-
-        return {"signals": n_signals, "fills": n_fills, "rejected": n_rejected,
-                "final_equity": self.equity, "cash": self.cash,
-                "return_pct": (self.equity / self.capital - 1) * 100}
+                    print("  [live] no quotes this round; waiting")
+                if duration_s and time.time() - t0 >= duration_s:
+                    break
+                time.sleep(interval_s)
+        except KeyboardInterrupt:
+            print("\n  [live] stopped by user")
+        return self._summary()

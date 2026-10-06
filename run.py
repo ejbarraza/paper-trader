@@ -17,6 +17,11 @@ Examples:
     # live prediction-market quotes over Polymarket's websocket (no key)
     python run.py --feed polymarket_ws \\
         --symbols xi-jinping-out-before-2027 --collect 60 --out ticks.csv
+
+    # paper-forward: trade live quotes as they print (Ctrl-C to stop)
+    python run.py --feed polymarket_ws \\
+        --symbols will-gavin-newsom-win-the-2028-democratic-presidential-nomination-568 \\
+        --strategies momentum,meanrev --live --interval 60 --duration 3600
 """
 
 from __future__ import annotations
@@ -64,6 +69,13 @@ def parse_args() -> argparse.Namespace:
                          "many seconds instead of running the engine")
     ap.add_argument("--out", default="ticks.csv",
                     help="output CSV for --collect")
+    ap.add_argument("--live", action="store_true",
+                    help="paper-forward mode: step the engine on live quotes "
+                         "instead of replaying history")
+    ap.add_argument("--interval", type=float, default=60.0,
+                    help="seconds between live steps")
+    ap.add_argument("--duration", type=float, default=0,
+                    help="live run length in seconds (0 = until Ctrl-C)")
     return ap.parse_args()
 
 
@@ -102,15 +114,27 @@ def main() -> None:
     engine = PaperEngine(feed, strats, arbiter, ledger,
                          capital=args.capital,
                          slippage_bps=args.slippage_bps)
-    summary = engine.run(symbols, date.fromisoformat(args.start),
-                         date.fromisoformat(args.end))
+
+    if args.live:
+        if args.dashboard:
+            import threading
+            threading.Thread(
+                target=lambda: create_app(args.db).run(port=args.port),
+                daemon=True).start()
+            print(f"dashboard: http://127.0.0.1:{args.port} (live)")
+        summary = engine.run_live(
+            symbols, interval_s=args.interval,
+            duration_s=args.duration or None)
+    else:
+        summary = engine.run(symbols, date.fromisoformat(args.start),
+                             date.fromisoformat(args.end))
     print("run summary:", summary)
 
     for row in ledger.strategy_pnl():
         print(f"  {row['strategy']:12s} trades={row['n_trades']:4d} "
               f"net=${row['net']:,.2f}")
 
-    if args.dashboard:
+    if args.dashboard and not args.live:
         print(f"dashboard: http://127.0.0.1:{args.port}")
         create_app(args.db).run(port=args.port)
 

@@ -66,9 +66,11 @@ hold keys, or touch a wallet. That is deliberate, not a missing feature.
   the kill-switches — risk management must never trap you in a position.
   Rejections carry machine-readable reasons (`strategy_budget_exceeded`,
   `drawdown_killswitch`, …) straight into the ledger.
-- **Engine** (`engine.py`) — bar-by-bar replay: settles expiries (assignment
-  or worthless), collects signals, arbitrates, simulates fills with slippage
-  and fees, marks to market, writes the ledger.
+- **Engine** (`engine.py`) — bar-by-bar replay *or* paper-forward live mode:
+  settles expiries (assignment or worthless), collects signals, arbitrates,
+  simulates fills with slippage and fees (live fills cross the real
+  bid/ask), marks to market, writes the ledger. Both modes share one
+  `_step()` so backtest and live can't drift apart.
 - **Dashboard** (`dashboard.py`) — read-only Flask app: equity curve,
   positions, per-strategy P&L, trade tape, and the risk-event log.
 
@@ -107,6 +109,24 @@ Record live prediction-market ticks, then backtest them:
 # ticks.csv holds top-of-book changes: ts,symbol,bid,ask,bid_size,ask_size,last
 # resample to bars (e.g. with pandas) and backtest through --feed csv
 ```
+
+Paper-forward mode — trade live quotes as they print (paper only, Ctrl-C to stop):
+
+```bash
+./.venv/bin/python run.py --feed polymarket_ws \
+  --symbols will-gavin-newsom-win-the-2028-democratic-presidential-nomination-568 \
+  --strategies momentum,meanrev --live --interval 60 --duration 3600 \
+  --dashboard
+# → http://127.0.0.1:5000 shows the equity curve updating live
+```
+
+How it works: every `--interval` seconds each symbol is quoted; the mid
+becomes the bar's close **with the real bid/ask attached**, so simulated
+fills cross the actual spread (buys lift the ask, sells hit the bid) instead
+of using a synthetic slippage around the close. Strategies warm up from feed
+history when the feed has one (Yahoo does; the websocket warms up live).
+Everything still passes through the shared risk arbiter and lands in the
+same SQLite ledger the dashboard reads.
 
 ## Repo layout
 

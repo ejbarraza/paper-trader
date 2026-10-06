@@ -37,6 +37,11 @@ class Bar:
     low: float
     close: float
     volume: float = 0.0
+    # Live top-of-book when the feed provides it (e.g. polymarket_ws).
+    # The engine fills buys at the ask and sells at the bid when present;
+    # historical bars leave these None and fills use close +/- slippage.
+    bid: Optional[float] = None
+    ask: Optional[float] = None
 
 
 @dataclass
@@ -487,13 +492,17 @@ class PolymarketWSFeed(MarketDataFeed):
                 if wanted:
                     ws.send_text(json.dumps({"type": "market",
                                              "assets_ids": wanted}))
+                    print(f"  [ws] connected, subscribed to {len(wanted)} token(s)")
+                else:
+                    print("  [ws] connected (no tokens wanted yet)")
                 hb = threading.Thread(target=self._heartbeat, args=(ws,),
                                       daemon=True)
                 hb.start()
                 ws.recv_loop(self._on_text, self._stop)
                 backoff = 1.0
-            except Exception:
-                pass
+            except Exception as e:
+                if not self._stop.is_set():
+                    print(f"  [ws] dropped ({e}); reconnecting in {backoff:g}s")
             finally:
                 with self._lock:
                     self._ws = None
