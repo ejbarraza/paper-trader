@@ -46,13 +46,24 @@ hold keys, or touch a wallet. That is deliberate, not a missing feature.
 - **Strategies** (`strategies.py`) — each sees one bar plus a read-only view
   (cash, equity, positions, recent closes) and emits signals. Strategies know
   nothing about risk; that separation is the point. Every strategy declares
-  the asset classes it can trade (`vrp` → options; `momentum`/`meanrev` →
-  stocks + predictions), and the engine refuses to run a strategy on a feed
-  it doesn't understand — loudly, never silently.
+  the asset classes it can trade (`vrp`/`tail`/`longvol` → options;
+  `momentum`/`meanrev` → stocks + predictions), and the engine refuses to
+  run a strategy on a feed it doesn't understand — loudly, never silently.
   - `vrp` **[options]** — sells the top-VRP cash-secured puts from the
     [options-scanner](https://github.com/ejbarraza/Options-Scanner) output,
     takes profit at 50% of premium, holds the rest to expiry week. Marks come
     from Black-Scholes on entry IV (documented assumption).
+  - `tail` **[options]** — put ratio backspread (short 1 higher-strike put /
+    long 2 lower-strike puts, same expiry) from the same scanner puts: the
+    long-convexity leg of the barbell. Long gamma, long vega — small bleed
+    if the market sits still, large payoff on a crash. The VRP leg's premium
+    is meant to fund it. Legs are emitted long-first so a partial arbiter
+    rejection can't strand a naked short, and the spread is managed atomically
+    (a repair check closes any short whose wing failed to fill).
+  - `longvol` **[options]** — buys long-dated (LEAPS) calls and puts from
+    the scanner's `_leaps.csv`, most at-the-money first (max gamma/vega per
+    contract). Pure long-vol convexity: max loss is the premium, no margin,
+    no assignment. Takes profit on doubles, exits inside one year to expiry.
   - `momentum` **[stocks, predictions]** — golden/death-cross trend following,
     long-only.
   - `meanrev` **[stocks, predictions]** — z-score fade, long or short, with a

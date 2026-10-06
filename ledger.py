@@ -101,14 +101,20 @@ class Ledger:
 
         ``net`` is total cash flow (exact, includes open positions' costs).
         Wins/losses come from FIFO-matching closes against opens per
-        (strategy, symbol): spot buy/sell/resolve, put sell/close/expire.
+        (strategy, symbol): spot buy/sell/resolve, short-put sell/close/
+        expire, long-put buy/close/expire, long-call buy/close/expire.
         An assigned put keeps its premium as realized and opens a stock lot
         at the strike (exactly what the engine records).
+
+        Realized P&L is in dollars throughout (option lots are scaled by
+        100x -- contracts x per-share points).
         """
         trades = self._all("SELECT * FROM trades ORDER BY id")
         # (strategy, symbol) -> list of [qty, price]; qty<0 means short/open put
         spot_lots: dict[tuple, list] = {}
-        put_lots: dict[tuple, list] = {}
+        put_lots: dict[tuple, list] = {}       # short puts: sell_put opens
+        long_put_lots: dict[tuple, list] = {}  # long puts: buy_put opens
+        long_call_lots: dict[tuple, list] = {}  # long calls: buy_call opens
         stats: dict[str, dict] = {}
 
         def st(s):
@@ -161,17 +167,42 @@ class Ledger:
                 put_lots.setdefault(key, []).append([q, px])
             elif a == "buy_put_close":
                 realized, _ = match(put_lots, key, q, px, -1)
+                realized *= 100.0  # contracts x per-share points -> dollars
+                row["realized"] += realized
+                self._bump_wl(row, realized)
+            elif a == "buy_put":
+                long_put_lots.setdefault(key, []).append([q, px])
+            elif a == "sell_put_close":
+                realized, _ = match(long_put_lots, key, q, px, +1)
+                realized *= 100.0
+                row["realized"] += realized
+                self._bump_wl(row, realized)
+            elif a == "buy_call":
+                long_call_lots.setdefault(key, []).append([q, px])
+            elif a == "sell_call_close":
+                realized, _ = match(long_call_lots, key, q, px, +1)
+                realized *= 100.0
                 row["realized"] += realized
                 self._bump_wl(row, realized)
             elif a == "expiry_worthless":
                 for lq, lp in put_lots.pop(key, []):
-                    row["realized"] += lq * lp
-                    self._bump_wl(row, lq * lp)
+                    realized = lq * lp * 100.0
+                    row["realized"] += realized
+                    self._bump_wl(row, realized)
             elif a == "expiry_assign":
                 for lq, lp in put_lots.pop(key, []):
-                    row["realized"] += lq * lp  # premium kept
-                    self._bump_wl(row, lq * lp)
+                    realized = lq * lp * 100.0  # premium kept
+                    row["realized"] += realized
+                    self._bump_wl(row, realized)
                 spot_lots.setdefault(key, []).append([q, px])  # shares @ strike
+            elif a in ("expiry_put_long", "expiry_call_long"):
+                lots = long_put_lots if a == "expiry_put_long" \
+                    else long_call_lots
+                for lq, lp in lots.pop(key, []):
+                    # collected intrinsic (px) vs premium paid (lp)
+                    realized = lq * (px - lp) * 100.0
+                    row["realized"] += realized
+                    self._bump_wl(row, realized)
         out = []
         for r in stats.values():
             w, l = r["wins"], r["losses"]

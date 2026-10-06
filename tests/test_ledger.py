@@ -73,8 +73,8 @@ def test_strategy_stats_put_round_trip():
     led.record_trade(ts, "vrp_puts", "APP", "sell_put", 2, 1.20, 238.70)
     led.record_trade(ts, "vrp_puts", "APP", "buy_put_close", 2, 0.60, -121.30)
     stats = {r["strategy"]: r for r in led.strategy_stats()}
-    # kept 0.60/contract x 2
-    assert stats["vrp_puts"]["realized"] == pytest.approx(1.20)
+    # kept 0.60/contract x 2 x 100 = $120 in dollars
+    assert stats["vrp_puts"]["realized"] == pytest.approx(120.0)
     assert stats["vrp_puts"]["wins"] == 1
 
 

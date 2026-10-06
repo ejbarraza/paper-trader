@@ -138,7 +138,7 @@ def main() -> None:
 
     strats = []
     for spec in [s.strip() for s in args.strategies.split(",") if s.strip()]:
-        if spec == "vrp":
+        if spec in ("vrp", "tail", "longvol"):
             kw = {"scanner_dir": args.scanner_dir}
         elif spec == "endgame":
             kw = {"symbols": symbols}

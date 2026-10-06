@@ -21,7 +21,7 @@ from typing import Optional
 
 from feeds import Bar, MarketDataFeed
 from ledger import Ledger
-from pricing import bs_put_price
+from pricing import bs_call_price, bs_put_price
 from risk import PortfolioState, RiskArbiter, RiskConfig
 from strategies import Ctx, Signal, Strategy
 
@@ -49,8 +49,11 @@ class PaperEngine:
         self.risk_free = risk_free
 
         self.cash = capital
-        self.positions: dict[tuple, float] = {}   # ("spot",sym) | ("put",sym,K,exp) -> qty
+        self.positions: dict[tuple, float] = {}   # ("spot",sym) |
+                                                  # ("put"|"call",sym,K,exp) -> qty
+                                                  # (negative = short)
         self.put_details: dict[tuple, dict] = {}  # put key -> {"iv","premium"}
+        self.call_details: dict[tuple, dict] = {}  # call key -> {"iv","premium"}
         self.closes: dict[str, list[float]] = defaultdict(list)
         self.latest: dict[str, Bar] = {}
         self.strategy_exposure: dict[str, float] = defaultdict(float)
@@ -76,8 +79,22 @@ class PaperEngine:
         T = max((date.fromisoformat(exp_iso) - today).days, 0) / 365.0
         return bs_put_price(S, strike, T, self.risk_free, iv)
 
+    def _call_mark(self, key: tuple, S: float, today: date) -> float:
+        _, _, strike, exp_iso = key
+        det = self.call_details.get(key, {})
+        iv = det.get("iv", 0.5)
+        T = max((date.fromisoformat(exp_iso) - today).days, 0) / 365.0
+        return bs_call_price(S, strike, T, self.risk_free, iv)
+
+    def _opt_mark(self, key: tuple, S: float, today: date) -> float:
+        """Black-Scholes mark for a ("put"|"call", sym, K, exp) key."""
+        if key[0] == "call":
+            return self._call_mark(key, S, today)
+        return self._put_mark(key, S, today)
+
     def _marks(self, today: date) -> dict[tuple, float]:
-        """position key -> total marked value."""
+        """position key -> total marked value (sign-correct: long positive,
+        short negative)."""
         out: dict[tuple, float] = {}
         for key, qty in self.positions.items():
             if qty == 0:
@@ -86,10 +103,10 @@ class PaperEngine:
                 bar = self.latest.get(key[1])
                 px = bar.close if bar else 0.0
                 out[key] = qty * px
-            else:  # short put liability
+            else:  # option, long or short
                 bar = self.latest.get(key[1])
                 S = bar.close if bar else 0.0
-                out[key] = qty * self._put_mark(key, S, today) * 100.0
+                out[key] = qty * self._opt_mark(key, S, today) * 100.0
         return out
 
     def _symbol_exposure(self, today: date) -> dict[str, float]:
@@ -101,8 +118,12 @@ class PaperEngine:
                 bar = self.latest.get(key[1])
                 px = bar.close if bar else 0.0
                 exp[key[1]] += abs(qty) * px
-            else:
+            elif qty < 0:  # short option: the assignment obligation
                 exp[key[1]] += abs(qty) * float(key[2]) * 100.0
+            else:  # long option: premium at risk, marked
+                bar = self.latest.get(key[1])
+                S = bar.close if bar else 0.0
+                exp[key[1]] += abs(qty) * self._opt_mark(key, S, today) * 100.0
         return dict(exp)
 
     # -- fills ----------------------------------------------------------
@@ -124,6 +145,28 @@ class PaperEngine:
             S = bar.close
             mark = self._put_mark(key, S, bar.ts.date())
             return mark * (1 + self.slippage)
+        if signal.action in ("buy_put", "buy_call"):
+            # Opening a long option: pay the ask. Strategies pass the
+            # scanner's ask as limit_price; fallback is a BS mark on the
+            # signal's IV (never the underlying's price -- that's not an
+            # option quote).
+            kind = "put" if signal.action == "buy_put" else "call"
+            if signal.limit_price:
+                return signal.limit_price * (1 + self.slippage)
+            S = bar.close
+            iv = (signal.meta or {}).get("iv", 0.5)
+            T = max((signal.expiry - bar.ts.date()).days, 0) / 365.0
+            pricer = bs_put_price if kind == "put" else bs_call_price
+            return pricer(S, signal.strike, T, self.risk_free, iv) \
+                * (1 + self.slippage)
+        if signal.action in ("sell_put_close", "sell_call_close"):
+            # Closing a long option: hit the bid, modeled as mark - slippage.
+            kind = "put" if signal.action == "sell_put_close" else "call"
+            key = (kind, signal.symbol, signal.strike,
+                   signal.expiry.isoformat())
+            S = bar.close
+            mark = self._opt_mark(key, S, bar.ts.date())
+            return mark * (1 - self.slippage)
         return 0.0
 
     def _apply_fill(self, signal: Signal, fill: float, ts: datetime) -> None:
@@ -176,7 +219,55 @@ class PaperEngine:
                                      "sell_put", contracts, fill,
                                      premium - fees,
                                      f"K={signal.strike} exp={signal.expiry} {signal.note}")
+        elif signal.action in ("buy_put", "buy_call"):
+            # Opening a long option: max loss is the premium paid.
+            kind = "put" if signal.action == "buy_put" else "call"
+            contracts = int(qty)
+            key = (kind, signal.symbol, signal.strike,
+                   signal.expiry.isoformat())
+            premium = contracts * fill * 100.0
+            fees = self.fee_per_contract * contracts
+            self.cash -= premium + fees
+            self.positions[key] = self.positions.get(key, 0.0) + contracts
+            det = self.put_details if kind == "put" else self.call_details
+            det[key] = {"iv": signal.meta.get("iv", 0.5), "premium": fill}
+            self.strategy_exposure[signal.strategy] += premium
+            self._key_strategy[key] = signal.strategy
+            self._key_exposure[key] = self._key_exposure.get(key, 0.0) + premium
+            self.ledger.record_trade(
+                ts, signal.strategy, signal.symbol, signal.action,
+                contracts, fill, -(premium + fees),
+                f"{'P' if kind == 'put' else 'C'}={signal.strike} "
+                f"exp={signal.expiry} {signal.note}")
+        elif signal.action in ("sell_put_close", "sell_call_close"):
+            # Closing a long option.
+            kind = "put" if signal.action == "sell_put_close" else "call"
+            contracts = int(qty)
+            key = (kind, signal.symbol, signal.strike,
+                   signal.expiry.isoformat())
+            pos_before = self.positions.get(key, 0.0)
+            proceeds = contracts * fill * 100.0 \
+                - self.fee_per_contract * contracts
+            self.cash += proceeds
+            self.positions[key] = pos_before - contracts
+            if abs(self.positions[key]) < 1e-9:
+                del self.positions[key]
+                (self.put_details if kind == "put"
+                 else self.call_details).pop(key, None)
+            released = self._key_exposure.get(key, 0.0) * (
+                contracts / pos_before if pos_before > 0 else 0.0)
+            self.strategy_exposure[signal.strategy] = max(
+                0.0, self.strategy_exposure[signal.strategy] - released)
+            self._key_exposure[key] = max(
+                0.0, self._key_exposure.get(key, 0.0) - released)
+            if key not in self.positions:
+                self._key_strategy.pop(key, None)
+                self._key_exposure.pop(key, None)
+            self.ledger.record_trade(ts, signal.strategy, signal.symbol,
+                                     signal.action, contracts, fill,
+                                     proceeds, signal.note)
         elif signal.action == "buy_put_close":
+            # Closing a short put: pay up (mark + slippage).
             contracts = int(qty)
             key = ("put", signal.symbol, signal.strike,
                    signal.expiry.isoformat())
@@ -202,31 +293,52 @@ class PaperEngine:
     # -- expiry ---------------------------------------------------------
     def _settle_expiries(self, today: date, ts: datetime) -> None:
         for key in [k for k in self.positions
-                    if len(k) == 4 and k[0] == "put"]:
-            _, sym, strike, exp_iso = key
+                    if len(k) == 4 and k[0] in ("put", "call")]:
+            kind, sym, strike, exp_iso = key
             if date.fromisoformat(exp_iso) > today:
                 continue
             qty = self.positions.pop(key)
-            self.put_details.pop(key, None)
+            (self.put_details if kind == "put"
+             else self.call_details).pop(key, None)
             contracts = abs(qty)
             bar = self.latest.get(sym)
             S = bar.close if bar else strike
-            if S < strike:
-                # assigned: buy the shares at the strike
-                shares = 100 * contracts
-                self.positions[("spot", sym)] = self._spot_qty(sym) + shares
-                cost = strike * shares
-                self.cash -= cost
-                self.ledger.record_trade(ts, "engine", sym, "expiry_assign",
-                                         shares, strike, -cost,
-                                         f"put K={strike} assigned, S={S:.2f}")
+            # The expiry P&L belongs to the strategy that opened the position,
+            # so FIFO attribution matches it against that strategy's lots.
+            strat = self._key_strategy.pop(key, "engine")
+            if qty < 0:
+                # Short put: assignment below the strike, worthless above.
+                # (The engine never opens short calls.)
+                if S < strike:
+                    shares = 100 * contracts
+                    self.positions[("spot", sym)] = \
+                        self._spot_qty(sym) + shares
+                    cost = strike * shares
+                    self.cash -= cost
+                    self.ledger.record_trade(ts, strat, sym,
+                                             "expiry_assign", shares,
+                                             strike, -cost,
+                                             f"put K={strike} assigned, "
+                                             f"S={S:.2f}")
+                else:
+                    self.ledger.record_trade(ts, strat, sym,
+                                             "expiry_worthless", contracts,
+                                             0.0, 0.0,
+                                             f"put K={strike} expired, "
+                                             f"S={S:.2f}")
+                released = self._key_exposure.pop(key, 0.0) \
+                    or contracts * strike * 100.0
             else:
-                self.ledger.record_trade(ts, "engine", sym, "expiry_worthless",
-                                         contracts, 0.0, 0.0,
-                                         f"put K={strike} expired, S={S:.2f}")
-            strat = self._key_strategy.pop(key, "vrp_puts")
-            released = self._key_exposure.pop(key, 0.0) \
-                or contracts * strike * 100.0
+                # Long option: collect intrinsic value at expiry.
+                intrinsic = max(strike - S, 0.0) if kind == "put" \
+                    else max(S - strike, 0.0)
+                value = contracts * intrinsic * 100.0
+                self.cash += value
+                self.ledger.record_trade(
+                    ts, strat, sym, f"expiry_{kind}_long",
+                    contracts, intrinsic, value,
+                    f"{kind} K={strike} expired, S={S:.2f}")
+                released = self._key_exposure.pop(key, 0.0)
             self.strategy_exposure[strat] = max(
                 0.0, self.strategy_exposure.get(strat, 0.0) - released)
 
@@ -305,7 +417,8 @@ class PaperEngine:
         ctx = Ctx(cash=self.cash, equity=self.equity, today=today,
                   positions=dict(self.positions),
                   closes={s: list(c) for s, c in self.closes.items()},
-                  put_details=dict(self.put_details))
+                  put_details=dict(self.put_details),
+                  call_details=dict(self.call_details))
         for strat in strategies:
             for bar in todays.values():
                 try:
@@ -345,10 +458,12 @@ class PaperEngine:
             if key[0] == "spot":
                 bar = self.latest.get(key[1])
                 snap[_pkey(key)] = (qty, bar.close if bar else 0.0)
-            else:
+            else:  # option, long or short: mark is the unsigned option
+                   # value; the qty sign carries the long/short direction
                 bar = self.latest.get(key[1])
                 S = bar.close if bar else 0.0
-                snap[_pkey(key)] = (qty, -self._put_mark(key, S, today) * 100.0)
+                snap[_pkey(key)] = (qty,
+                                    self._opt_mark(key, S, today) * 100.0)
         self.ledger.snapshot_positions(ts, snap)
 
     def _summary(self) -> dict:

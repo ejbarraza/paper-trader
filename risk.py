@@ -50,8 +50,12 @@ class RiskArbiter:
     def signal_notional(signal: Signal, fill_price: float) -> float:
         if signal.action == "sell_put":
             return signal.quantity * (signal.strike or 0.0) * 100.0
-        if signal.action == "buy_put_close":
+        if signal.action in ("buy_put_close", "sell_put_close",
+                             "sell_call_close"):
             return 0.0  # exits free exposure
+        if signal.action in ("buy_put", "buy_call"):
+            # Long option: max loss is the premium paid.
+            return abs(signal.quantity) * fill_price * 100.0
         return abs(signal.quantity) * fill_price  # spot
 
     def check(self, signal: Signal, est_fill: float,
