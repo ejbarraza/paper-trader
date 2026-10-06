@@ -1,0 +1,10 @@
+{
+  "feed": "yahoo",
+  "symbols": ["QQQ"],
+  "strategies": "pie:pies/qqq.json",
+  "capital": 10000,
+  "start": "2024-01-01",
+  "end": "2024-12-31",
+  "db": "qqq.db",
+  "max_exposure": 1.0
+}

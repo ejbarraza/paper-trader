@@ -75,8 +75,8 @@ hold keys, or touch a wallet. That is deliberate, not a missing feature.
     `settlements()`. No outcome oracle is modeled — the backtest hit-rate
     is the honest metric.
 - **Feeds** declare what they provide (`yahoo` → stocks, `polymarket` →
-  predictions, `csv` → your choice via `--csv-asset-class`). See them with
-  `python run.py --list-strategies`.
+  predictions, `csv` → your choice via `--csv-asset-class`). See strategies
+  with `python run.py strategies`.
 - **Risk arbiter** (`risk.py`) — every signal passes through: per-strategy
   budgets, per-symbol and portfolio exposure caps, a price-band anti-chase
   rule, and two kill-switches (daily loss, max drawdown). Exits always pass
@@ -113,20 +113,48 @@ python3 -m venv .venv
 ./.venv/bin/python -m pip install -r requirements.txt
 
 # backtest two classic loops on stocks (Yahoo, no key needed)
-./.venv/bin/python run.py --feed yahoo --symbols AAPL,MSFT \
+./.venv/bin/python run.py backtest --feed yahoo --symbols AAPL,MSFT \
   --strategies momentum,meanrev --start 2024-01-01 --end 2024-12-31 \
   --capital 100000
 
-# paper-trade the scanner's VRP put candidates, then open the dashboard
-./.venv/bin/python run.py --feed yahoo --symbols APP,PLTR --strategies vrp \
-  --scanner-dir ../options_scanner/outputs --capital 100000 --dashboard
+# not sure what to run? answer a few prompts instead
+./.venv/bin/python run.py interactive
+
+# see every strategy
+./.venv/bin/python run.py strategies
+```
+
+Strategies are opt-in only — nothing runs unless you name it. Config can
+ride with the name (`--strategies "pie:pies/qqq.json,momentum"`), or pass
+`--pie` on its own to run a buy-and-hold pie:
+
+```bash
+# benchmark leg: buy-and-hold QQQ in its own ledger
+./.venv/bin/python run.py backtest --pie pies/qqq.json --symbols QQQ \
+  --capital 10000 --max-exposure 1.0 --db qqq.db
+
+# ...then overlay it against your active book
+./.venv/bin/python run.py dashboard --db paper.db --compare qqq.db
 # → http://127.0.0.1:5000
+```
+
+Repeat a run from a file instead of flags (`books/` has a sample; CLI
+flags override the file):
+
+```bash
+./.venv/bin/python run.py backtest --book books/qqq-benchmark.json
+```
+
+Static HTML snapshot of any ledger (no server needed):
+
+```bash
+./.venv/bin/python run.py report --db paper.db --out report.html
 ```
 
 Tune risk without touching code:
 
 ```bash
-./.venv/bin/python run.py --feed csv --csv-dir data --symbols AAA \
+./.venv/bin/python run.py backtest --feed csv --csv-dir data --symbols AAA \
   --strategies momentum --max-drawdown 0.10 --daily-loss-limit 0.02 \
   --slippage-bps 10
 ```
@@ -135,19 +163,20 @@ Record live prediction-market ticks, then backtest them:
 
 ```bash
 # stream the real order book for 60s (no key; YES token by default)
-./.venv/bin/python run.py --feed polymarket_ws \
+./.venv/bin/python run.py collect \
   --symbols will-gavin-newsom-win-the-2028-democratic-presidential-nomination-568 \
-  --collect 60 --out ticks.csv
+  --seconds 60 --out ticks.csv
 # ticks.csv holds top-of-book changes: ts,symbol,bid,ask,bid_size,ask_size,last
-# resample to bars (e.g. with pandas) and backtest through --feed csv
+./.venv/bin/python run.py resample ticks.csv --out bars --freq 60
+# backtest the bars through --feed csv
 ```
 
 Paper-forward mode — trade live quotes as they print (paper only, Ctrl-C to stop):
 
 ```bash
-./.venv/bin/python run.py --feed polymarket_ws \
+./.venv/bin/python run.py live --feed polymarket_ws \
   --symbols will-gavin-newsom-win-the-2028-democratic-presidential-nomination-568 \
-  --strategies momentum,meanrev --live --interval 60 --duration 3600 \
+  --strategies momentum,meanrev --interval 60 --duration 3600 \
   --dashboard
 # → http://127.0.0.1:5000 shows the equity curve updating live
 ```
@@ -166,7 +195,7 @@ next to the DB every step so the dashboard's banner reads LIVE/STALE.
 Find tradeable markets instead of hand-feeding slugs:
 
 ```bash
-./.venv/bin/python run.py --discover --min-volume 100000 \
+./.venv/bin/python run.py discover --min-volume 100000 \
   --min-liquidity 10000 --max-markets 25
 ```
 
