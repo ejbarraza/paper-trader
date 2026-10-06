@@ -47,6 +47,9 @@ class MarketDataFeed(ABC):
     """Common contract for every market-data source."""
 
     name: str = "base"
+    # What this feed provides: "stocks" | "options" | "predictions".
+    # The engine only runs strategies whose asset_classes include it.
+    asset_class: str = "stocks"
 
     @abstractmethod
     def history(self, symbol: str, start: date, end: date) -> list[Bar]:
@@ -117,6 +120,7 @@ class PolymarketFeed(MarketDataFeed):
     """
 
     name = "polymarket"
+    asset_class = "predictions"
     GAMMA = "https://gamma-api.polymarket.com"
     CLOB = "https://clob.polymarket.com"
 
@@ -185,8 +189,9 @@ class CsvFeed(MarketDataFeed):
 
     name = "csv"
 
-    def __init__(self, directory: str):
+    def __init__(self, directory: str, asset_class: str = "stocks"):
         self.directory = directory
+        self.asset_class = asset_class
 
     def _path(self, symbol: str) -> str:
         import os

@@ -39,13 +39,21 @@ hold keys, or touch a wallet. That is deliberate, not a missing feature.
   empty; the engine skips the symbol loudly instead of trading on stale air.
 - **Strategies** (`strategies.py`) — each sees one bar plus a read-only view
   (cash, equity, positions, recent closes) and emits signals. Strategies know
-  nothing about risk; that separation is the point.
-  - `vrp` — sells the top-VRP cash-secured puts from the
+  nothing about risk; that separation is the point. Every strategy declares
+  the asset classes it can trade (`vrp` → options; `momentum`/`meanrev` →
+  stocks + predictions), and the engine refuses to run a strategy on a feed
+  it doesn't understand — loudly, never silently.
+  - `vrp` **[options]** — sells the top-VRP cash-secured puts from the
     [options-scanner](https://github.com/ejbarraza/Options-Scanner) output,
     takes profit at 50% of premium, holds the rest to expiry week. Marks come
     from Black-Scholes on entry IV (documented assumption).
-  - `momentum` — golden/death-cross trend following, long-only.
-  - `meanrev` — z-score fade, long or short, with a hard stop.
+  - `momentum` **[stocks, predictions]** — golden/death-cross trend following,
+    long-only.
+  - `meanrev` **[stocks, predictions]** — z-score fade, long or short, with a
+    hard stop.
+- **Feeds** declare what they provide (`yahoo` → stocks, `polymarket` →
+  predictions, `csv` → your choice via `--csv-asset-class`). See them with
+  `python run.py --list-strategies`.
 - **Risk arbiter** (`risk.py`) — every signal passes through: per-strategy
   budgets, per-symbol and portfolio exposure caps, a price-band anti-chase
   rule, and two kill-switches (daily loss, max drawdown). Exits always pass

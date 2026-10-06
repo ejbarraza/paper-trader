@@ -197,6 +197,20 @@ class PaperEngine:
 
     # -- main loop ------------------------------------------------------
     def run(self, symbols: list[str], start: date, end: date) -> dict:
+        # Asset-class gating: a strategy only runs on a feed it understands.
+        # Mismatches are skipped loudly, never silently.
+        compatible = [s for s in self.strategies
+                      if self.feed.asset_class in s.asset_classes]
+        for s in self.strategies:
+            if s not in compatible:
+                print(f"  [engine] skipping '{s.name}': needs "
+                      f"{sorted(s.asset_classes)}, feed '{self.feed.name}' "
+                      f"provides '{self.feed.asset_class}'")
+        if not compatible:
+            return {"error": "no strategy compatible with "
+                             f"{self.feed.asset_class} feed"}
+        strategies = compatible
+
         histories = {}
         for s in symbols:
             bars = self.feed.history(s, start, end)
@@ -232,7 +246,7 @@ class PaperEngine:
                       positions=dict(self.positions),
                       closes={s: list(c) for s, c in self.closes.items()},
                       put_details=dict(self.put_details))
-            for strat in self.strategies:
+            for strat in strategies:
                 for bar in todays.values():
                     try:
                         signals = strat.on_bar(bar, ctx) or []

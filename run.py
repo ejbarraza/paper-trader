@@ -25,7 +25,7 @@ from engine import PaperEngine
 from feeds import build_feed
 from ledger import Ledger
 from risk import RiskArbiter, RiskConfig
-from strategies import build_strategy
+from strategies import build_strategy, describe_strategies
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,6 +34,9 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--symbols", default="AAPL,MSFT",
                     help="comma-separated symbols (slugs for polymarket)")
     ap.add_argument("--csv-dir", default="data")
+    ap.add_argument("--csv-asset-class", default="stocks",
+                    choices=["stocks", "options", "predictions"],
+                    help="what the CSV files contain")
     ap.add_argument("--strategies", default="momentum,meanrev",
                     help="comma-separated: vrp,momentum,meanrev")
     ap.add_argument("--scanner-dir", default="../options_scanner/outputs",
@@ -48,13 +51,22 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--dashboard", action="store_true",
                     help="serve the dashboard after the run")
     ap.add_argument("--port", type=int, default=5000)
+    ap.add_argument("--list-strategies", action="store_true",
+                    help="show registered strategies and their asset classes")
     return ap.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.list_strategies:
+        print(f"{'spec':10s} {'strategy':12s} {'asset classes':28s} blurb")
+        for d in describe_strategies():
+            print(f"{d['name']:10s} {d['strategy']:12s} "
+                  f"{','.join(d['asset_classes']):28s} {d['blurb']}")
+        return
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
-    feed_kwargs = {"directory": args.csv_dir} if args.feed == "csv" else {}
+    feed_kwargs = {"directory": args.csv_dir,
+                   "asset_class": args.csv_asset_class} if args.feed == "csv" else {}
     feed = build_feed(args.feed, **feed_kwargs)
 
     strats = []

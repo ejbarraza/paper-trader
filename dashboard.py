@@ -13,6 +13,10 @@ import argparse
 import json
 
 from ledger import Ledger
+from strategies import STRATEGY_INFO
+
+_STRAT_ASSET = {info["class"].name: ",".join(sorted(info["class"].asset_classes))
+                for info in STRATEGY_INFO.values()}
 
 INDEX_HTML = """<!doctype html>
 <html><head><meta charset="utf-8">
@@ -38,7 +42,7 @@ section{margin-bottom:28px}h2{font-size:16px;margin-bottom:8px}
 <div class="cards" id="cards"></div>
 <section><h2>Equity curve</h2><canvas id="eq" width="900" height="260"></canvas></section>
 <section><h2>Open positions</h2><table id="pos"><tr><th>Position</th><th>Qty</th><th>Mark</th><th>Value</th></tr></table></section>
-<section><h2>Strategy P&amp;L</h2><table id="strat"><tr><th>Strategy</th><th>Trades</th><th>Net P&amp;L</th></tr></table></section>
+<section><h2>Strategy P&amp;L</h2><table id="strat"><tr><th>Strategy</th><th>Asset class</th><th>Trades</th><th>Net P&amp;L</th></tr></table></section>
 <section><h2>Recent trades</h2><table id="trades"><tr><th>Time</th><th>Strategy</th><th>Symbol</th><th>Action</th><th>Qty</th><th>Price</th><th>Cash Δ</th><th>Note</th></tr></table></section>
 <section><h2>Risk events <span style="color:#8b949e;font-weight:normal">(orders the arbiter blocked)</span></h2><table id="risk"><tr><th>Time</th><th>Strategy</th><th>Symbol</th><th>Action</th><th>Reason</th></tr></table></section>
 <script>
@@ -65,7 +69,7 @@ function row(t,cells){const tr=document.createElement('tr');cells.forEach(c=>{co
  const pos=await j('/api/positions');
  pos.forEach(p=>row(document.getElementById('pos'),[p.pkey,p.qty,fmt$(p.mark),fmt$(p.qty*p.mark)]));
  const st=await j('/api/strategies');
- st.forEach(s=>row(document.getElementById('strat'),[s.strategy,s.n_trades,`<span class="${s.net>=0?'up':'down'}">${fmt$(s.net)}</span>`]));
+ st.forEach(s=>row(document.getElementById('strat'),[s.strategy,s.asset_class,s.n_trades,`<span class="${s.net>=0?'up':'down'}">${fmt$(s.net)}</span>`]));
  const tr=await j('/api/trades');
  tr.slice(0,50).forEach(t=>row(document.getElementById('trades'),[t.ts.slice(0,16),t.strategy,t.symbol,t.action,t.qty,fmt$(t.price),fmt$(t.cash_delta),(t.note||'').slice(0,60)]));
  const rk=await j('/api/risk');
@@ -94,7 +98,10 @@ def create_app(db_path: str):
 
     @app.get("/api/strategies")
     def api_strategies():
-        return jsonify(led.strategy_pnl())
+        rows = led.strategy_pnl()
+        for r in rows:
+            r["asset_class"] = _STRAT_ASSET.get(r["strategy"], "?")
+        return jsonify(rows)
 
     @app.get("/api/trades")
     def api_trades():

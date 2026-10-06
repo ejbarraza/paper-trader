@@ -55,6 +55,10 @@ class Ctx:
 
 class Strategy(ABC):
     name: str = "base"
+    # Asset classes this loop can trade: "stocks" | "options" | "predictions".
+    # The engine only runs a strategy on a feed whose asset class is in here.
+    asset_classes: frozenset[str] = frozenset({"stocks"})
+    blurb: str = ""
 
     @abstractmethod
     def on_bar(self, bar: Bar, ctx: Ctx) -> list[Signal]:
@@ -75,6 +79,8 @@ class VrpPutSellingStrategy(Strategy):
     """
 
     name = "vrp_puts"
+    asset_classes = frozenset({"options"})
+    blurb = "Sells the scanner's top-VRP cash-secured puts"
 
     def __init__(self, scanner_dir: str, top_n: int = 3,
                  dte_min: int = 30, dte_max: int = 45, min_vrp: float = 0.0,
@@ -185,6 +191,8 @@ class MomentumStrategy(Strategy):
     """Golden-cross / death-cross trend following, long-only spot."""
 
     name = "momentum"
+    asset_classes = frozenset({"stocks", "predictions"})
+    blurb = "Golden/death-cross trend following, long-only spot"
 
     def __init__(self, fast: int = 20, slow: int = 50,
                  allocation_frac: float = 0.10):
@@ -216,6 +224,8 @@ class MeanReversionStrategy(Strategy):
     """Z-score fade on spot, long or short with a hard stop."""
 
     name = "meanrev"
+    asset_classes = frozenset({"stocks", "predictions"})
+    blurb = "Z-score fade on spot, long or short with a hard stop"
 
     def __init__(self, lookback: int = 20, z_entry: float = 2.0,
                  z_exit: float = 0.5, z_stop: float = 3.5,
@@ -254,11 +264,24 @@ class MeanReversionStrategy(Strategy):
         return []
 
 
+STRATEGY_INFO: dict[str, dict] = {
+    "vrp": {"class": VrpPutSellingStrategy},
+    "momentum": {"class": MomentumStrategy},
+    "meanrev": {"class": MeanReversionStrategy},
+}
+
+
+def describe_strategies() -> list[dict]:
+    """Name, asset classes, and blurb for every registered strategy."""
+    return [{"name": spec,
+             "strategy": info["class"].name,
+             "asset_classes": sorted(info["class"].asset_classes),
+             "blurb": info["class"].blurb}
+            for spec, info in STRATEGY_INFO.items()]
+
+
 def build_strategy(spec: str, **kwargs) -> Strategy:
     """``spec`` like ``"vrp"``, ``"momentum"``, ``"meanrev"``."""
-    table = {"vrp": VrpPutSellingStrategy,
-             "momentum": MomentumStrategy,
-             "meanrev": MeanReversionStrategy}
-    if spec not in table:
-        raise ValueError(f"unknown strategy {spec!r}; choose from {sorted(table)}")
-    return table[spec](**kwargs)
+    if spec not in STRATEGY_INFO:
+        raise ValueError(f"unknown strategy {spec!r}; choose from {sorted(STRATEGY_INFO)}")
+    return STRATEGY_INFO[spec]["class"](**kwargs)
