@@ -33,13 +33,16 @@ hold keys, or touch a wallet. That is deliberate, not a missing feature.
                                                      └────────────────┘
 ```
 
-- **Feeds** (`feeds.py`) — one interface, four sources: Yahoo Finance
+- **Feeds** (`feeds.py`) — one interface, five sources: Yahoo Finance
   (stocks, free), Polymarket's public Gamma API (prediction markets, free),
   **Polymarket US** via `gateway.polymarket.us` (the separate CFTC-regulated
   fiat venue — different hosts and market structure from .com; no public
-  history endpoint, so it's live/paper-forward only), CSV files
-  (deterministic backtests). A feed that can't produce data returns
-  empty; the engine skips the symbol loudly instead of trading on stale air.
+  history endpoint, so it's live/paper-forward only), **Polymarket WebSocket**
+  (`polymarket_ws` — the public CLOB market channel, tick-by-tick order
+  books with no polling and no key; `slug` = YES token, `slug:NO` = NO
+  token), CSV files (deterministic backtests). A feed that can't produce
+  data returns empty; the engine skips the symbol loudly instead of trading
+  on stale air.
 - **Strategies** (`strategies.py`) — each sees one bar plus a read-only view
   (cash, equity, positions, recent closes) and emits signals. Strategies know
   nothing about risk; that separation is the point. Every strategy declares
@@ -94,10 +97,22 @@ Tune risk without touching code:
   --slippage-bps 10
 ```
 
+Record live prediction-market ticks, then backtest them:
+
+```bash
+# stream the real order book for 60s (no key; YES token by default)
+./.venv/bin/python run.py --feed polymarket_ws \
+  --symbols will-gavin-newsom-win-the-2028-democratic-presidential-nomination-568 \
+  --collect 60 --out ticks.csv
+# ticks.csv holds top-of-book changes: ts,symbol,bid,ask,bid_size,ask_size,last
+# resample to bars (e.g. with pandas) and backtest through --feed csv
+```
+
 ## Repo layout
 
 ```
-feeds.py       # MarketDataFeed interface: yahoo / polymarket / csv
+feeds.py       # MarketDataFeed interface: yahoo / polymarket (.com REST) /
+               #   polymarket_us / polymarket_ws (live order-book socket) / csv
 strategies.py  # Strategy interface + vrp, momentum, meanrev loops
 risk.py        # RiskArbiter: budgets, exposure caps, kill-switches
 engine.py      # PaperEngine: event loop, fills, expiry, marks

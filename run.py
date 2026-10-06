@@ -13,6 +13,10 @@ Examples:
     # deterministic backtest from CSVs in ./data
     python run.py --feed csv --csv-dir data --symbols AAA,BBB \\
         --strategies momentum --start 2024-01-01 --end 2024-06-30
+
+    # live prediction-market quotes over Polymarket's websocket (no key)
+    python run.py --feed polymarket_ws \\
+        --symbols xi-jinping-out-before-2027 --collect 60 --out ticks.csv
 """
 
 from __future__ import annotations
@@ -31,7 +35,8 @@ from strategies import build_strategy, describe_strategies
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Paper-trading engine (paper only).")
     ap.add_argument("--feed", default="yahoo",
-                    choices=["yahoo", "polymarket", "polymarket_us", "csv"])
+                    choices=["yahoo", "polymarket", "polymarket_us",
+                             "polymarket_ws", "csv"])
     ap.add_argument("--symbols", default="AAPL,MSFT",
                     help="comma-separated symbols (slugs for polymarket)")
     ap.add_argument("--csv-dir", default="data")
@@ -54,6 +59,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--port", type=int, default=5000)
     ap.add_argument("--list-strategies", action="store_true",
                     help="show registered strategies and their asset classes")
+    ap.add_argument("--collect", type=float, default=0,
+                    help="with --feed polymarket_ws: record live ticks for this "
+                         "many seconds instead of running the engine")
+    ap.add_argument("--out", default="ticks.csv",
+                    help="output CSV for --collect")
     return ap.parse_args()
 
 
@@ -68,7 +78,15 @@ def main() -> None:
     symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
     feed_kwargs = {"directory": args.csv_dir,
                    "asset_class": args.csv_asset_class} if args.feed == "csv" else {}
+    if args.feed == "polymarket_ws":
+        feed_kwargs = {"symbols": symbols}
     feed = build_feed(args.feed, **feed_kwargs)
+
+    if args.feed == "polymarket_ws" and args.collect > 0:
+        path, n = feed.collect_ticks(symbols, args.collect, args.out)
+        feed.stop()
+        print(f"recorded {n} ticks -> {path}")
+        return
 
     strats = []
     for spec in [s.strip() for s in args.strategies.split(",") if s.strip()]:

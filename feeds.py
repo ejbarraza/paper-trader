@@ -12,12 +12,20 @@ Paper only: feeds are read-only. Nothing here can place an order.
 
 from __future__ import annotations
 
+import base64
 import csv
 import json
+import os
+import socket
+import ssl as _ssl
+import struct
+import threading
+import time
+import urllib.parse
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Optional
+from typing import Callable, Optional
 
 
 @dataclass
@@ -255,6 +263,461 @@ class PolymarketUSFeed(MarketDataFeed):
         return []  # no public history endpoint on the US gateway
 
 
+# ---------------------------------------------------------------------------
+# Minimal WebSocket client (stdlib only)
+# ---------------------------------------------------------------------------
+
+def _proxy_parts() -> Optional[tuple]:
+    """(host, port, user, password) from *_proxy env vars, or None."""
+    for var in ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY",
+                "all_proxy", "ALL_PROXY"):
+        raw = os.environ.get(var)
+        if not raw:
+            continue
+        u = urllib.parse.urlparse(raw)
+        if u.hostname:
+            return u.hostname, u.port or 3128, u.username, u.password
+    return None
+
+
+class _WSClient:
+    """Bare-minimum RFC 6455 client: proxy CONNECT, TLS, masked text frames,
+    ping/pong, and an application-level PING heartbeat. Just enough for
+    Polymarket's market channel -- not a general-purpose library."""
+
+    def __init__(self, url: str):
+        u = urllib.parse.urlparse(url)
+        if u.scheme != "wss":
+            raise ValueError("only wss:// is supported")
+        self.host = u.hostname
+        self.port = u.port or 443
+        self.path = u.path or "/"
+        self.sock: Optional[socket.socket] = None
+
+    def connect(self, timeout: int = 15) -> None:
+        proxy = _proxy_parts()
+        if proxy:
+            phost, pport, puser, ppass = proxy
+            raw = socket.create_connection((phost, pport), timeout=timeout)
+            # Try without proxy credentials first: some egress proxies
+            # 407 requests that *carry* (stale) credentials yet allow the
+            # same source IP through unauthenticated.
+            for with_auth in (False, True):
+                auth = ""
+                if with_auth and puser:
+                    tok = base64.b64encode(
+                        f"{puser}:{ppass or ''}".encode()).decode()
+                    auth = f"Proxy-Authorization: Basic {tok}\r\n"
+                raw.sendall(
+                    f"CONNECT {self.host}:{self.port} HTTP/1.1\r\n"
+                    f"Host: {self.host}:{self.port}\r\n{auth}\r\n".encode())
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = raw.recv(4096)
+                    if not chunk:
+                        break
+                    resp += chunk
+                status = resp.split(b"\r\n", 1)[0]
+                if b" 200 " in status:
+                    break
+                if b" 407 " in status and not with_auth and puser:
+                    continue
+                raw.close()
+                raise ConnectionError(f"proxy CONNECT failed: {status!r}")
+            sock = raw
+        else:
+            sock = socket.create_connection((self.host, self.port),
+                                            timeout=timeout)
+        sock = _ssl.create_default_context().wrap_socket(
+            sock, server_hostname=self.host)
+        key = base64.b64encode(os.urandom(16)).decode()
+        sock.sendall(
+            f"GET {self.path} HTTP/1.1\r\nHost: {self.host}\r\n"
+            f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            f"Sec-WebSocket-Key: {key}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n\r\n".encode())
+        resp = b""
+        while b"\r\n\r\n" not in resp:
+            chunk = sock.recv(4096)
+            if not chunk:
+                break
+            resp += chunk
+        if b" 101 " not in resp.split(b"\r\n", 1)[0]:
+            sock.close()
+            raise ConnectionError(f"websocket upgrade failed: {resp[:80]!r}")
+        self.sock = sock
+
+    def send_text(self, text: str) -> None:
+        data = text.encode()
+        mask = os.urandom(4)
+        n = len(data)
+        if n < 126:
+            hdr = bytes([0x81, 0x80 | n])
+        elif n < 65536:
+            hdr = bytes([0x81, 0x80 | 126]) + struct.pack(">H", n)
+        else:
+            hdr = bytes([0x81, 0x80 | 127]) + struct.pack(">Q", n)
+        self.sock.sendall(hdr + mask +
+                          bytes(b ^ mask[i % 4] for i, b in enumerate(data)))
+
+    def _recv_exact(self, n: int) -> bytes:
+        data = b""
+        while len(data) < n:
+            chunk = self.sock.recv(n - len(data))
+            if not chunk:
+                raise ConnectionError("socket closed")
+            data += chunk
+        return data
+
+    def _recv_text(self) -> Optional[str]:
+        """Next complete text message; None on clean close."""
+        frags: list[bytes] = []
+        while True:
+            h = self._recv_exact(2)
+            fin, op = h[0] & 0x80, h[0] & 0x0F
+            ln = h[1] & 0x7F
+            if ln == 126:
+                ln = struct.unpack(">H", self._recv_exact(2))[0]
+            elif ln == 127:
+                ln = struct.unpack(">Q", self._recv_exact(8))[0]
+            payload = self._recv_exact(ln) if ln else b""
+            if op == 0x8:
+                return None
+            if op == 0x9:  # ping -> pong
+                self._send_ctrl(0xA, payload)
+                continue
+            if op == 0xA:  # pong
+                continue
+            if op in (0x1, 0x0):
+                frags.append(payload)
+                if fin:
+                    return b"".join(frags).decode("utf-8", "replace")
+
+    def _send_ctrl(self, op: int, payload: bytes = b"") -> None:
+        mask = os.urandom(4)
+        hdr = bytes([0x80 | op, 0x80 | len(payload)]) + mask
+        self.sock.sendall(hdr + bytes(b ^ mask[i % 4]
+                                      for i, b in enumerate(payload)))
+
+    def recv_loop(self, on_text: Callable[[str], None],
+                  stop: threading.Event) -> None:
+        """Block reading messages until stop is set, the socket closes, or
+        nothing arrives for 120s (stale connection -> reconnect)."""
+        self.sock.settimeout(1.0)
+        last_rx = time.time()
+        while not stop.is_set():
+            try:
+                msg = self._recv_text()
+            except socket.timeout:
+                if time.time() - last_rx > 120:
+                    raise ConnectionError("websocket stale")
+                continue
+            if msg is None:
+                raise ConnectionError("websocket closed by server")
+            last_rx = time.time()
+            if msg == "PONG":
+                continue
+            on_text(msg)
+
+    def close(self) -> None:
+        try:
+            if self.sock:
+                self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
+
+
+class PolymarketWSFeed(MarketDataFeed):
+    """Live order-book feed over Polymarket's public CLOB WebSocket.
+
+    ``wss://ws-subscriptions-clob.polymarket.com/ws/market`` -- no API key.
+    Keeps a real-time book per token (snapshot + deltas) and serves
+    ``latest_quote()`` from the live top-of-book instead of a polled REST
+    quote, so spreads, depth and prints are the market's own, tick by tick.
+
+    ``symbol`` is a market slug for the YES token, or ``"slug:NO"`` for the
+    NO token (matches the YES=outcome-0 convention of PolymarketFeed).
+
+    ``history()`` is [] -- a socket is live-only by nature. Use
+    ``collect_ticks()`` to record a session, then backtest the recording
+    through the CSV feed.
+    """
+
+    name = "polymarket_ws"
+    asset_class = "predictions"
+    WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+    GAMMA = "https://gamma-api.polymarket.com"
+
+    def __init__(self, symbols: Optional[list] = None):
+        self._symbols = list(symbols or [])
+        self._books: dict = {}        # asset_id -> {bids, asks, last, ts}
+        self._asset_of: dict = {}     # symbol -> asset_id
+        self._wanted: set = set()     # asset_ids to (re)subscribe
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._ws: Optional[_WSClient] = None
+        self._listeners: list = []    # fn(symbol, top_dict)
+        self._last_top: dict = {}     # asset_id -> (bid, ask) last notified
+
+    # -- connection management -------------------------------------------
+    def _ensure_started(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        with self._lock:
+            if self._thread and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._worker, daemon=True,
+                                            name="polymarket-ws")
+            self._thread.start()
+        for s in self._symbols:
+            self._subscribe_symbol(s)
+
+    def _worker(self) -> None:
+        backoff = 1.0
+        while not self._stop.is_set():
+            try:
+                ws = _WSClient(self.WS_URL)
+                ws.connect()
+                with self._lock:
+                    self._ws = ws
+                    wanted = sorted(self._wanted)
+                if wanted:
+                    ws.send_text(json.dumps({"type": "market",
+                                             "assets_ids": wanted}))
+                hb = threading.Thread(target=self._heartbeat, args=(ws,),
+                                      daemon=True)
+                hb.start()
+                ws.recv_loop(self._on_text, self._stop)
+                backoff = 1.0
+            except Exception:
+                pass
+            finally:
+                with self._lock:
+                    self._ws = None
+            if self._stop.is_set():
+                break
+            time.sleep(backoff)
+            backoff = min(backoff * 2.0, 30.0)
+
+    def _heartbeat(self, ws: _WSClient) -> None:
+        # Application-level keepalive: the market channel expects a "PING"
+        # text frame every ~10s and answers "PONG".
+        while not self._stop.is_set():
+            time.sleep(10)
+            try:
+                ws.send_text("PING")
+            except Exception:
+                break
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._lock:
+            ws = self._ws
+        if ws:
+            ws.close()
+
+    # -- subscription -----------------------------------------------------
+    def _resolve_token(self, symbol: str) -> Optional[str]:
+        slug, _, side = symbol.partition(":")
+        idx = 1 if side.strip().upper() == "NO" else 0
+        try:
+            import requests
+            r = requests.get(f"{self.GAMMA}/markets", params={"slug": slug},
+                             timeout=15)
+            r.raise_for_status()
+            data = r.json()
+            if not data:
+                return None
+            tids = json.loads(data[0].get("clobTokenIds", "[]"))
+            return tids[idx] if idx < len(tids) else None
+        except Exception:
+            return None
+
+    def _subscribe_symbol(self, symbol: str) -> None:
+        with self._lock:
+            if symbol in self._asset_of:
+                return
+        aid = self._resolve_token(symbol)
+        if not aid:
+            return
+        with self._lock:
+            self._asset_of[symbol] = aid
+            new = aid not in self._wanted
+            self._wanted.add(aid)
+            ws = self._ws
+        # The channel accepts subscribe deltas without reconnecting.
+        if new and ws is not None:
+            try:
+                ws.send_text(json.dumps({"assets_ids": [aid],
+                                         "operation": "subscribe"}))
+            except Exception:
+                pass  # the worker (re)subscribes the full wanted set
+
+    # -- message handling ---------------------------------------------------
+    def _on_text(self, raw: str) -> None:
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return
+        for e in (data if isinstance(data, list) else [data]):
+            if not isinstance(e, dict) or "asset_id" not in e:
+                continue
+            aid = e["asset_id"]
+            if "changes" in e:
+                self._apply_delta(aid, e["changes"])
+            elif any(k in e for k in ("bids", "asks", "buys", "sells")):
+                self._apply_snapshot(aid, e)
+            elif e.get("event_type") == "last_trade_price":
+                self._apply_last(aid, e)
+
+    @staticmethod
+    def _levels(entries) -> dict:
+        out = {}
+        for lv in entries or []:
+            try:
+                out[float(lv["price"])] = float(lv["size"])
+            except (KeyError, TypeError, ValueError):
+                continue
+        return out
+
+    @staticmethod
+    def _ts(raw) -> Optional[datetime]:
+        try:
+            return datetime.fromtimestamp(int(raw) / 1000.0)
+        except (TypeError, ValueError):
+            return None
+
+    def _apply_snapshot(self, aid: str, e: dict) -> None:
+        bids = self._levels(e.get("bids") or e.get("buys"))
+        asks = self._levels(e.get("asks") or e.get("sells"))
+        with self._lock:
+            b = self._books.setdefault(
+                aid, {"bids": {}, "asks": {}, "last": None, "ts": None})
+            b["bids"], b["asks"] = bids, asks
+            b["ts"] = self._ts(e.get("timestamp")) or datetime.now()
+        self._notify(aid)
+
+    def _apply_delta(self, aid: str, changes) -> None:
+        with self._lock:
+            b = self._books.setdefault(
+                aid, {"bids": {}, "asks": {}, "last": None, "ts": None})
+            for ch in changes or []:
+                try:
+                    px, sz = float(ch["price"]), float(ch["size"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                side = b["bids"] if ch.get("side") == "BUY" else b["asks"]
+                if sz == 0:
+                    side.pop(px, None)
+                else:
+                    side[px] = sz
+            b["ts"] = datetime.now()
+        self._notify(aid)
+
+    def _apply_last(self, aid: str, e: dict) -> None:
+        try:
+            px = float(e["price"])
+        except (KeyError, TypeError, ValueError):
+            return
+        with self._lock:
+            b = self._books.setdefault(
+                aid, {"bids": {}, "asks": {}, "last": None, "ts": None})
+            b["last"] = px
+        self._notify(aid)
+
+    def _top(self, aid: str) -> Optional[dict]:
+        b = self._books.get(aid)
+        if not b or not b["bids"] or not b["asks"]:
+            return None
+        bid, ask = max(b["bids"]), min(b["asks"])
+        return {"bid": bid, "ask": ask,
+                "bid_size": b["bids"][bid], "ask_size": b["asks"][ask],
+                "last": b["last"], "ts": b["ts"] or datetime.now()}
+
+    def _notify(self, aid: str) -> None:
+        with self._lock:
+            top = self._top(aid)
+            if not top:
+                return
+            key = (top["bid"], top["ask"])
+            if self._last_top.get(aid) == key:
+                return
+            self._last_top[aid] = key
+            # symbol lookup needs the reverse map; rebuild cheaply
+            sym = next((s for s, a in self._asset_of.items() if a == aid),
+                       aid)
+            listeners = list(self._listeners)
+        for fn in listeners:
+            try:
+                fn(sym, top)
+            except Exception:
+                pass
+
+    # -- MarketDataFeed interface -------------------------------------------
+    def latest_quote(self, symbol: str) -> Optional[Quote]:
+        self._ensure_started()
+        self._subscribe_symbol(symbol)
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            with self._lock:
+                aid = self._asset_of.get(symbol)
+                top = self._top(aid) if aid else None
+                last = (self._books.get(aid) or {}).get("last") if aid else None
+            if top and top["bid"] > 0 and top["ask"] > top["bid"]:
+                return Quote(ts=top["ts"], symbol=symbol,
+                             bid=top["bid"], ask=top["ask"])
+            if last:
+                spread = max(last * 0.01, 0.002)
+                return Quote(ts=datetime.now(), symbol=symbol,
+                             bid=max(last - spread / 2, 0.001),
+                             ask=min(last + spread / 2, 0.999))
+            time.sleep(0.2)
+        return None
+
+    def history(self, symbol: str, start: date, end: date) -> list[Bar]:
+        return []  # live-only; record with collect_ticks(), backtest via CSV
+
+    # -- tick recording -------------------------------------------------------
+    def collect_ticks(self, symbols: list, seconds: float,
+                     out_csv: str) -> tuple:
+        """Record top-of-book ticks for ``seconds`` and write them to CSV.
+
+        Columns: ts,symbol,bid,ask,bid_size,ask_size,last -- one row per
+        top-of-book change. Resample to bars (e.g. with pandas) and backtest
+        through the CSV feed.
+        """
+        self._ensure_started()
+        for s in symbols:
+            self._subscribe_symbol(s)
+        rows: list = []
+
+        def _listen(sym: str, top: dict) -> None:
+            rows.append({"ts": top["ts"].isoformat(), "symbol": sym,
+                         "bid": top["bid"], "ask": top["ask"],
+                         "bid_size": top["bid_size"],
+                         "ask_size": top["ask_size"],
+                         "last": top["last"] if top["last"] is not None
+                         else ""})
+
+        with self._lock:
+            self._listeners.append(_listen)
+        try:
+            time.sleep(seconds)
+        finally:
+            with self._lock:
+                if _listen in self._listeners:
+                    self._listeners.remove(_listen)
+        with open(out_csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=["ts", "symbol", "bid", "ask",
+                                              "bid_size", "ask_size", "last"])
+            w.writeheader()
+            w.writerows(rows)
+        return out_csv, len(rows)
+
+
 class CsvFeed(MarketDataFeed):
     """Bars from ``<SYMBOL>.csv`` files: ts,symbol,open,high,low,close,volume.
 
@@ -302,7 +765,8 @@ class CsvFeed(MarketDataFeed):
 
 def build_feed(kind: str, **kwargs) -> MarketDataFeed:
     kinds = {"yahoo": YahooFeed, "polymarket": PolymarketFeed,
-             "polymarket_us": PolymarketUSFeed, "csv": CsvFeed}
+             "polymarket_us": PolymarketUSFeed,
+             "polymarket_ws": PolymarketWSFeed, "csv": CsvFeed}
     if kind not in kinds:
         raise ValueError(f"unknown feed {kind!r}; choose from {sorted(kinds)}")
     return kinds[kind](**kwargs)
