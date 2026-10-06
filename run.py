@@ -30,7 +30,8 @@ from strategies import build_strategy, describe_strategies
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Paper-trading engine (paper only).")
-    ap.add_argument("--feed", default="yahoo", choices=["yahoo", "polymarket", "csv"])
+    ap.add_argument("--feed", default="yahoo",
+                    choices=["yahoo", "polymarket", "polymarket_us", "csv"])
     ap.add_argument("--symbols", default="AAPL,MSFT",
                     help="comma-separated symbols (slugs for polymarket)")
     ap.add_argument("--csv-dir", default="data")

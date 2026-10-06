@@ -33,9 +33,12 @@ hold keys, or touch a wallet. That is deliberate, not a missing feature.
                                                      └────────────────┘
 ```
 
-- **Feeds** (`feeds.py`) — one interface, three sources: Yahoo Finance
+- **Feeds** (`feeds.py`) — one interface, four sources: Yahoo Finance
   (stocks, free), Polymarket's public Gamma API (prediction markets, free),
-  CSV files (deterministic backtests). A feed that can't produce data returns
+  **Polymarket US** via `gateway.polymarket.us` (the separate CFTC-regulated
+  fiat venue — different hosts and market structure from .com; no public
+  history endpoint, so it's live/paper-forward only), CSV files
+  (deterministic backtests). A feed that can't produce data returns
   empty; the engine skips the symbol loudly instead of trading on stale air.
 - **Strategies** (`strategies.py`) — each sees one bar plus a read-only view
   (cash, equity, positions, recent closes) and emits signals. Strategies know

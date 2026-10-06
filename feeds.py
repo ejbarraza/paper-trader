@@ -180,6 +180,81 @@ class PolymarketFeed(MarketDataFeed):
         return sorted(bars, key=lambda b: b.ts)
 
 
+class PolymarketUSFeed(MarketDataFeed):
+    """Polymarket US (polymarket.us): the CFTC-regulated, fiat (USD) venue.
+
+    A *separate product* from polymarket.com -- different hosts, auth, and
+    SDKs; nothing is carried over from the .com feed. Public market data via
+    https://gateway.polymarket.us, no key needed.
+
+    ``symbol`` is a market slug. Quotes track outcome index 0: top-of-book is
+    used when the spread is sane (< 50c), otherwise the ``outcomePrices`` mid
+    with a synthetic spread (US books are often extremely thin).
+
+    Limitation: the US gateway exposes no public price-history endpoint, so
+    ``history()`` returns []. This feed is for live/paper-forward use;
+    backtest US markets through the CSV feed.
+    """
+
+    name = "polymarket_us"
+    asset_class = "predictions"
+    GATEWAY = "https://gateway.polymarket.us"
+
+    def _get(self, path: str, params: dict | None = None, timeout: int = 15):
+        import requests
+        r = requests.get(self.GATEWAY + path, params=params or {},
+                         timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+
+    def _market(self, slug: str) -> Optional[dict]:
+        try:
+            ms = self._get("/v1/markets", {"slug": slug}).get("markets", [])
+            return ms[0] if ms else None
+        except Exception:
+            return None
+
+    def _book(self, slug: str) -> Optional[dict]:
+        try:
+            return self._get(f"/v1/markets/{slug}/book").get("marketData")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _px(entry: dict) -> Optional[float]:
+        try:
+            return float(entry["px"]["value"])
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def latest_quote(self, symbol: str) -> Optional[Quote]:
+        now = datetime.now()
+        book = self._book(symbol)
+        if book:
+            bids = [p for p in (self._px(b) for b in book.get("bids", []))
+                    if p is not None]
+            offers = [p for p in (self._px(o) for o in book.get("offers", []))
+                      if p is not None]
+            if bids and offers:
+                bid, ask = max(bids), min(offers)
+                if 0 < bid < ask < 1 and (ask - bid) < 0.50:
+                    return Quote(ts=now, symbol=symbol, bid=bid, ask=ask)
+        m = self._market(symbol)
+        if m:
+            try:
+                px = float(json.loads(m["outcomePrices"])[0])
+                spread = max(px * 0.02, 0.005)
+                return Quote(ts=now, symbol=symbol,
+                             bid=max(px - spread / 2, 0.001),
+                             ask=min(px + spread / 2, 0.999))
+            except (KeyError, ValueError, TypeError, IndexError):
+                pass
+        return None
+
+    def history(self, symbol: str, start: date, end: date) -> list[Bar]:
+        return []  # no public history endpoint on the US gateway
+
+
 class CsvFeed(MarketDataFeed):
     """Bars from ``<SYMBOL>.csv`` files: ts,symbol,open,high,low,close,volume.
 
@@ -226,7 +301,8 @@ class CsvFeed(MarketDataFeed):
 
 
 def build_feed(kind: str, **kwargs) -> MarketDataFeed:
-    kinds = {"yahoo": YahooFeed, "polymarket": PolymarketFeed, "csv": CsvFeed}
+    kinds = {"yahoo": YahooFeed, "polymarket": PolymarketFeed,
+             "polymarket_us": PolymarketUSFeed, "csv": CsvFeed}
     if kind not in kinds:
         raise ValueError(f"unknown feed {kind!r}; choose from {sorted(kinds)}")
     return kinds[kind](**kwargs)
