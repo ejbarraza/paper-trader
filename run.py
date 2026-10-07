@@ -283,6 +283,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", required=True)
     p.add_argument("--compare", default=None)
 
+    p = sub.add_parser("iv-hv",
+                       help="plot IV vs HV for a ticker (Yahoo, no creds)")
+    p.add_argument("ticker")
+    p.add_argument("--days", type=int, default=365,
+                   help="lookback for the HV regime panel")
+    p.add_argument("--risk-free", type=float, default=0.04)
+    p.add_argument("--out", default=None,
+                   help="PNG path (default outputs/ivhv_<ticker>_<date>.png)")
+
     sub.add_parser("reconcile",
                    help="audit a ledger's invariants").add_argument(
                        "--db", required=True)
@@ -424,6 +433,13 @@ def cmd_report(args) -> None:
     print(f"wrote {args.out} ({len(html) // 1024} KB)")
 
 
+def cmd_iv_hv(args) -> None:
+    from ivhv import main as ivhv_main
+    ivhv_main([args.ticker, "--days", str(args.days),
+               "--risk-free", str(args.risk_free)] +
+              (["--out", args.out] if args.out else []))
+
+
 def cmd_reconcile(args) -> None:
     from reconcile import audit
     print(f"reconciling {args.db}")
@@ -514,6 +530,8 @@ def main(argv=None) -> None:
         cmd_dashboard(args)
     elif cmd == "report":
         cmd_report(args)
+    elif cmd == "iv-hv":
+        cmd_iv_hv(args)
     elif cmd == "reconcile":
         cmd_reconcile(args)
     elif cmd == "interactive":

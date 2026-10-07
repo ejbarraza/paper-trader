@@ -212,6 +212,17 @@ Find tradeable markets instead of hand-feeding slugs:
   --min-liquidity 10000 --max-markets 25
 ```
 
+See the variance-risk-premium picture the put-selling leg trades on:
+
+```bash
+./.venv/bin/python run.py iv-hv SPY
+```
+
+That backs out implied vol from the Yahoo chain (bisection on the
+Black-Scholes pricer, two-sided quotes only) and plots the IV term structure
+against the 10/30-day realized-vol regime — VRP per expiry printed to the
+console.
+
 ## Testing
 
 ```bash
@@ -240,6 +251,8 @@ reconcile.py   # ledger audit harness: cash walk, equity decomposition,
 dashboard.py   # read-only Flask operator view (health, attribution)
 resample.py    # tick CSV -> OHLC bars for backtesting recordings
 discover.py    # Gamma scan for liquid, order-book-enabled markets
+ivhv.py        # options calculator: backs out IV from chains (bisection on
+               #   the BS pricer), plots IV term structure vs HV regime
 tests/         # pytest suite (no network)
 run.py         # CLI
 ```
