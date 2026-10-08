@@ -223,10 +223,26 @@ Black-Scholes pricer, two-sided quotes only) and plots the IV term structure
 against the 10/30-day realized-vol regime — VRP per expiry printed to the
 console.
 
+Simulate a Panoptic-style perpetual short put on CEX data (no chain reads):
+
+```bash
+./.venv/bin/python run.py panoptic-lab BTC --days 90
+```
+
+Selling the put is modeled as single-sided USDC liquidity in a Uniswap v3
+range below spot (exact v3 math: price falls into the range and you get
+progressively "assigned"). Streamia accrues at the fair rate — the
+gamma-theta identity, ½ΓS²σ² per day — so the lab is VRP harvesting in
+streaming form. The comparison leg rolls TradFi 30-day cash-secured puts,
+re-struck at the same OTM. Note the structural asymmetry the chart shows:
+the v3 range is static (struck once; streamia dies as price rallies away)
+while the rolls re-strike every expiry — real Panoptic sellers reposition
+ranges, which the lab does not model.
+
 ## Testing
 
 ```bash
-./.venv/bin/python -m pytest tests/ -q   # 60+ tests, no network needed
+./.venv/bin/python -m pytest tests/ -q   # 140+ tests, no network needed
 ```
 
 Covers the feed registry and WS book parser (synthetic messages), strategy

@@ -296,6 +296,24 @@ def build_parser() -> argparse.ArgumentParser:
                    help="audit a ledger's invariants").add_argument(
                        "--db", required=True)
 
+    p = sub.add_parser("panoptic-lab",
+                       help="simulate a Panoptic-style perpetual short put "
+                            "(Binance, no creds)")
+    p.add_argument("ticker", nargs="?", default="BTC")
+    p.add_argument("--days", type=int, default=90)
+    p.add_argument("--otm", type=float, default=0.05,
+                   help="range top below spot, fraction")
+    p.add_argument("--width", type=float, default=0.10,
+                   help="range width as fraction of range top")
+    p.add_argument("--iv", type=float, default=None,
+                   help="implied vol (default: 30d HV of the path)")
+    p.add_argument("--notional", type=float, default=10000)
+    p.add_argument("--dte", type=int, default=30,
+                   help="TradFi comparison put expiry, days")
+    p.add_argument("--risk-free", type=float, default=0.04)
+    p.add_argument("--out", default=None,
+                   help="PNG path (default outputs/panoptic_<ticker>_<date>.png)")
+
     p = sub.add_parser("discover",
                        help="scan Polymarket for liquid tradeable markets")
     p.add_argument("--min-volume", type=float, default=100_000.0)
@@ -440,6 +458,16 @@ def cmd_iv_hv(args) -> None:
               (["--out", args.out] if args.out else []))
 
 
+def cmd_panoptic_lab(args) -> None:
+    from panoptic_lab import main as panoptic_main
+    panoptic_main([args.ticker, "--days", str(args.days),
+                   "--otm", str(args.otm), "--width", str(args.width),
+                   "--notional", str(args.notional), "--dte", str(args.dte),
+                   "--risk-free", str(args.risk_free)] +
+                  (["--iv", str(args.iv)] if args.iv is not None else []) +
+                  (["--out", args.out] if args.out else []))
+
+
 def cmd_reconcile(args) -> None:
     from reconcile import audit
     print(f"reconciling {args.db}")
@@ -532,6 +560,8 @@ def main(argv=None) -> None:
         cmd_report(args)
     elif cmd == "iv-hv":
         cmd_iv_hv(args)
+    elif cmd == "panoptic-lab":
+        cmd_panoptic_lab(args)
     elif cmd == "reconcile":
         cmd_reconcile(args)
     elif cmd == "interactive":
