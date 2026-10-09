@@ -655,11 +655,23 @@ def test_mutation_expiry_attribution_strategy_not_engine():
 # ---------------------------------------------------------------------------
 # Part 5 -- real-data replay: reconcile harness on shipped backtest DBs
 # ---------------------------------------------------------------------------
+# The backtest DBs are local artifacts (gitignored via *.db), produced by the
+# pie backtest runs -- e.g. `run.py backtest --pie ... --db backtests/csi_100k.db`.
+# A fresh checkout (CI included) does not have them, so these tests skip
+# instead of failing when the artifact is absent.
+
+def _replay_db(name: str) -> str:
+    db = REPO / "backtests" / name
+    if not db.exists():
+        pytest.skip(f"backtest artifact {name} not present "
+                    f"(gitignored; generate with a pie backtest run)")
+    return str(db)
+
 
 def test_replay_csi_100k_reconcile_invariants():
     from reconcile import (check_cash_walk, check_equity_decomposition,
                            check_open_lots)
-    db = str(REPO / "backtests" / "csi_100k.db")
+    db = _replay_db("csi_100k.db")
     for name, fn in [("cash_walk", check_cash_walk),
                      ("equity_decomposition", check_equity_decomposition),
                      ("open_lots", check_open_lots)]:
@@ -670,7 +682,7 @@ def test_replay_csi_100k_reconcile_invariants():
 def test_replay_ai_memory_reconcile_invariants():
     from reconcile import (check_cash_walk, check_equity_decomposition,
                            check_open_lots)
-    db = str(REPO / "backtests" / "ai_memory.db")
+    db = _replay_db("ai_memory.db")
     for name, fn in [("cash_walk", check_cash_walk),
                      ("equity_decomposition", check_equity_decomposition),
                      ("open_lots", check_open_lots)]:
