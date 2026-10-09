@@ -10,6 +10,15 @@ risk arbiter, a sqlite tracking DB, an operator dashboard) — **all code here
 is original**. Paper only: there is no code path that can place a live order,
 hold keys, or touch a wallet. That is deliberate, not a missing feature.
 
+## Prerequisites
+
+All `run.py` commands must be executed with the project venv interpreter —
+`~/workspace/paper-trader/.venv/bin/python`. System `python3`
+(`/usr/bin/python3`) lacks the dependencies (yfinance, pandas, Flask, …) and
+will fail with `ModuleNotFoundError`. `requirements.txt` is pinned to the
+exact versions in the working venv (frozen 2026-10-08); CI runs
+`pytest tests/ -q` on every push.
+
 ## Architecture
 
 ```

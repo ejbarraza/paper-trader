@@ -34,18 +34,47 @@ class Ledger:
                 PRIMARY KEY (ts, pkey));
             CREATE TABLE IF NOT EXISTS snapshots(
                 ts TEXT PRIMARY KEY);
+            -- A/E tracker: decision-time expected premium per opening trade.
+            -- expected is signed dollars: + premium the signal expected to
+            -- collect (short_put opens at the scanner bid), - premium it
+            -- expected to pay (long opens at the ask) or spend (spot buys).
+            -- Backward compatible: old DBs simply have no rows here.
+            CREATE TABLE IF NOT EXISTS ae_expected(
+                trade_id INTEGER PRIMARY KEY,
+                ts TEXT NOT NULL,
+                strategy TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                leg TEXT NOT NULL,
+                expected REAL NOT NULL);
         """)
         self._db.commit()
 
     # -- writes ---------------------------------------------------------
     def record_trade(self, ts: datetime, strategy: str, symbol: str,
                      action: str, qty: float, price: float,
-                     cash_delta: float, note: str = "") -> None:
-        self._db.execute(
+                     cash_delta: float, note: str = "") -> int:
+        """Record a trade; returns the trade row id (used to link A/E marks)."""
+        cur = self._db.execute(
             "INSERT INTO trades(ts,strategy,symbol,action,qty,price,cash_delta,note)"
             " VALUES (?,?,?,?,?,?,?,?)",
             (ts.isoformat(), strategy, symbol, action, qty, price,
              cash_delta, note))
+        self._db.commit()
+        return cur.lastrowid
+
+    def record_ae_mark(self, ts: datetime, strategy: str, symbol: str,
+                       leg: str, expected: float, trade_id: int) -> None:
+        """Record the decision-time expected premium for an opening trade.
+
+        leg: short_put | long_put | long_call | spot. expected is signed
+        dollars (see ae_expected schema). Called by the engine for every
+        opening fill whose signal carried a limit price.
+        """
+        self._db.execute(
+            "INSERT OR REPLACE INTO ae_expected"
+            "(trade_id,ts,strategy,symbol,leg,expected)"
+            " VALUES (?,?,?,?,?,?)",
+            (trade_id, ts.isoformat(), strategy, symbol, leg, expected))
         self._db.commit()
 
     def record_equity(self, ts: datetime, equity: float, cash: float) -> None:
@@ -127,7 +156,7 @@ class Ledger:
         realized P&L per closed round trip; ``profit_factor`` is gross
         wins / gross losses.
         """
-        stats, _, _ = self._fifo_walk()
+        stats, _, _, _ = self._fifo_walk()
         return stats
 
     def realized_series(self) -> list[dict]:
@@ -135,10 +164,11 @@ class Ledger:
         order: [{"ts", "strategy", "realized"}]. A step function over
         closed trades only -- the raw material for judging edge. Open
         positions contribute nothing until they close."""
-        _, series, _ = self._fifo_walk(collect_series=True)
+        _, series, _, _ = self._fifo_walk(collect_series=True)
         return series
 
-    def _fifo_walk(self, collect_series: bool = False):
+    def _fifo_walk(self, collect_series: bool = False,
+                   collect_leg_series: bool = False):
         trades = self._all("SELECT * FROM trades ORDER BY id")
         # (strategy, symbol) -> list of [qty, price]; qty<0 means short/open put
         spot_lots: dict[tuple, list] = {}
@@ -169,6 +199,7 @@ class Ledger:
             return realized, qty
 
         series: list[dict] = []
+        leg_series: list[dict] = []
         for t in trades:
             s, sym, a = t["strategy"], t["symbol"], t["action"]
             q, px, cd = t["qty"], t["price"], t["cash_delta"]
@@ -176,10 +207,13 @@ class Ledger:
             row["net"] += cd
             row["n_trades"] += 1
             key = (s, sym)
+            realized_before = row["realized"]
+            leg = None  # which book this trade closed against, if any
             if a == "buy":                # cover shorts first, then open long
                 realized, rem = match(spot_lots, key, q, px, +1)
                 row["realized"] += realized
                 self._bump_wl(row, realized)
+                leg = "spot"
                 if rem > 1e-9:
                     spot_lots.setdefault(key, []).append([rem, px])
             elif a == "sell":
@@ -187,6 +221,7 @@ class Ledger:
                 realized, rem = match(spot_lots, key, q, px, +1)
                 row["realized"] += realized
                 self._bump_wl(row, realized)
+                leg = "spot"
                 if rem > 1e-9:
                     spot_lots.setdefault(key, []).append([-rem, px])
             elif a == "resolve":
@@ -194,6 +229,7 @@ class Ledger:
                 # shorts: realized sign flips via lot sign in match()
                 row["realized"] += realized
                 self._bump_wl(row, realized)
+                leg = "spot"
             elif a == "sell_put":
                 put_lots.setdefault(key, []).append([q, px])
             elif a == "buy_put_close":
@@ -201,6 +237,7 @@ class Ledger:
                 realized *= 100.0  # contracts x per-share points -> dollars
                 row["realized"] += realized
                 self._bump_wl(row, realized)
+                leg = "short_put"
             elif a == "buy_put":
                 long_put_lots.setdefault(key, []).append([q, px])
             elif a == "sell_put_close":
@@ -208,6 +245,7 @@ class Ledger:
                 realized *= 100.0
                 row["realized"] += realized
                 self._bump_wl(row, realized)
+                leg = "long_put"
             elif a == "buy_call":
                 long_call_lots.setdefault(key, []).append([q, px])
             elif a == "sell_call_close":
@@ -215,17 +253,20 @@ class Ledger:
                 realized *= 100.0
                 row["realized"] += realized
                 self._bump_wl(row, realized)
+                leg = "long_call"
             elif a == "expiry_worthless":
                 for lq, lp in put_lots.pop(key, []):
                     realized = lq * lp * 100.0
                     row["realized"] += realized
                     self._bump_wl(row, realized)
+                leg = "short_put"
             elif a == "expiry_assign":
                 for lq, lp in put_lots.pop(key, []):
                     realized = lq * lp * 100.0  # premium kept
                     row["realized"] += realized
                     self._bump_wl(row, realized)
                 spot_lots.setdefault(key, []).append([q, px])  # shares @ strike
+                leg = "short_put"
             elif a in ("expiry_put_long", "expiry_call_long"):
                 lots = long_put_lots if a == "expiry_put_long" \
                     else long_call_lots
@@ -234,6 +275,12 @@ class Ledger:
                     realized = lq * (px - lp) * 100.0
                     row["realized"] += realized
                     self._bump_wl(row, realized)
+                leg = "long_put" if a == "expiry_put_long" else "long_call"
+            if collect_leg_series:
+                delta = row["realized"] - realized_before
+                if leg is not None and abs(delta) > 1e-9:
+                    leg_series.append({"ts": t["ts"], "strategy": s,
+                                       "leg": leg, "delta": round(delta, 2)})
             if collect_series:
                 series.append({"ts": t["ts"], "strategy": s,
                                "realized": round(row["realized"], 2)})
@@ -257,12 +304,58 @@ class Ledger:
                 if abs(net) > 1e-9:
                     open_lots[(book_name, s, sym)] = net
         return (sorted(out, key=lambda r: r["net"], reverse=True),
-                series, open_lots)
+                series, open_lots, leg_series)
+
+    def ae_summary(self) -> list[dict]:
+        """Actual-vs-expected premium per (strategy, leg, month).
+
+        Expected: decision-time premium the signal acted on, recorded by
+        the engine at every opening fill (scanner bid for premium
+        collection, ask for premium paid). Realized: FIFO-matched closed
+        P&L per leg. ae_pct = realized/expected*100.
+
+        Read it on premium-collecting legs (short_put): A/E near 100%
+        means the signal's premium survived fills, spread and fees;
+        sustained drift below 100% is the earliest signal that edge is
+        decaying or costs are eating it. ae_pct is None when there is no
+        positive expected base or no closed round trips in the month --
+        an open position contributes nothing until it closes.
+        """
+        marks = self._all(
+            "SELECT strategy, leg, substr(ts, 1, 7) AS month,"
+            " SUM(expected) AS expected, COUNT(*) AS n_opens"
+            " FROM ae_expected GROUP BY strategy, leg, month")
+        _, _, _, leg_series = self._fifo_walk(collect_leg_series=True)
+        real: dict[tuple, dict] = {}
+        for e in leg_series:
+            k = (e["strategy"], e["leg"], e["ts"][:7])
+            r = real.setdefault(k, {"realized": 0.0, "n_closes": 0})
+            r["realized"] += e["delta"]
+            r["n_closes"] += 1
+        out = []
+        keys = {(m["strategy"], m["leg"], m["month"]) for m in marks} | set(real)
+        for strategy, leg, month in sorted(keys):
+            m = next((x for x in marks
+                      if (x["strategy"], x["leg"], x["month"])
+                      == (strategy, leg, month)),
+                     {"expected": 0.0, "n_opens": 0})
+            r = real.get((strategy, leg, month),
+                         {"realized": 0.0, "n_closes": 0})
+            expected = m["expected"]
+            ae_pct = None
+            if expected > 1e-9 and r["n_closes"] > 0:
+                ae_pct = round(r["realized"] / expected * 100.0, 1)
+            out.append({"strategy": strategy, "leg": leg, "month": month,
+                        "expected": round(expected, 2),
+                        "realized": round(r["realized"], 2),
+                        "ae_pct": ae_pct, "n_opens": m["n_opens"],
+                        "n_closes": r["n_closes"]})
+        return out
 
     def implied_open_qty(self) -> dict[tuple, float]:
         """Net open qty per (book, strategy, symbol) implied by the trade
         tape. See _fifo_walk for book conventions."""
-        _, _, lots = self._fifo_walk()
+        _, _, lots, _ = self._fifo_walk()
         return lots
 
     def rejection_summary(self) -> dict:

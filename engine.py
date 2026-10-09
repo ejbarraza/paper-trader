@@ -169,6 +169,31 @@ class PaperEngine:
             return mark * (1 - self.slippage)
         return 0.0
 
+    def _ae_mark(self, ts: datetime, signal: Signal, leg: str,
+                 trade_id: int) -> None:
+        """Record the decision-time expected premium for an opening fill.
+
+        signal.limit_price is the quote the strategy acted on (scanner bid
+        for premium collection, ask for premium paid); the fill then
+        crosses the spread and pays slippage/fees. The gap between this
+        mark and the FIFO realized P&L is what ae_summary() reports as
+        A/E drift. Skipped when the signal carried no limit price
+        (expected premium unknown). Spot marks are signed decision-time
+        notional, approximate under netting like the arbiter's accounting.
+        """
+        lp = signal.limit_price
+        if lp is None:
+            return
+        qty = signal.quantity
+        if leg == "short_put":
+            expected = lp * int(qty) * 100.0
+        elif leg in ("long_put", "long_call"):
+            expected = -lp * int(qty) * 100.0
+        else:  # spot
+            expected = -lp * qty if signal.action == "buy" else lp * qty
+        self.ledger.record_ae_mark(ts, signal.strategy, signal.symbol,
+                                   leg, expected, trade_id)
+
     def _apply_fill(self, signal: Signal, fill: float, ts: datetime) -> None:
         qty = signal.quantity
         if signal.action == "buy":
@@ -179,8 +204,10 @@ class PaperEngine:
             self.strategy_exposure[signal.strategy] += qty * fill
             self._key_strategy[key] = signal.strategy
             self._key_exposure[key] = self._key_exposure.get(key, 0.0) + qty * fill
-            self.ledger.record_trade(ts, signal.strategy, signal.symbol,
-                                     "buy", qty, fill, -cost, signal.note)
+            tid = self.ledger.record_trade(ts, signal.strategy, signal.symbol,
+                                           "buy", qty, fill, -cost,
+                                           signal.note)
+            self._ae_mark(ts, signal, "spot", tid)
         elif signal.action == "sell":
             proceeds = qty * fill - self.fee_per_share * qty
             self.cash += proceeds
@@ -198,8 +225,10 @@ class PaperEngine:
                 if abs(new_qty) < 1e-9:
                     self._key_strategy.pop(key, None)
                     self._key_exposure.pop(key, None)
-            self.ledger.record_trade(ts, signal.strategy, signal.symbol,
-                                     "sell", qty, fill, proceeds, signal.note)
+            tid = self.ledger.record_trade(ts, signal.strategy, signal.symbol,
+                                             "sell", qty, fill, proceeds,
+                                             signal.note)
+            self._ae_mark(ts, signal, "spot", tid)
         elif signal.action == "sell_put":
             contracts = int(qty)
             key = ("put", signal.symbol, signal.strike,
@@ -215,10 +244,11 @@ class PaperEngine:
             self._key_strategy[key] = signal.strategy
             self._key_exposure[key] = self._key_exposure.get(key, 0.0) \
                 + contracts * signal.strike * 100.0
-            self.ledger.record_trade(ts, signal.strategy, signal.symbol,
-                                     "sell_put", contracts, fill,
-                                     premium - fees,
-                                     f"K={signal.strike} exp={signal.expiry} {signal.note}")
+            tid = self.ledger.record_trade(ts, signal.strategy, signal.symbol,
+                                             "sell_put", contracts, fill,
+                                             premium - fees,
+                                             f"K={signal.strike} exp={signal.expiry} {signal.note}")
+            self._ae_mark(ts, signal, "short_put", tid)
         elif signal.action in ("buy_put", "buy_call"):
             # Opening a long option: max loss is the premium paid.
             kind = "put" if signal.action == "buy_put" else "call"
@@ -234,11 +264,13 @@ class PaperEngine:
             self.strategy_exposure[signal.strategy] += premium
             self._key_strategy[key] = signal.strategy
             self._key_exposure[key] = self._key_exposure.get(key, 0.0) + premium
-            self.ledger.record_trade(
+            tid = self.ledger.record_trade(
                 ts, signal.strategy, signal.symbol, signal.action,
                 contracts, fill, -(premium + fees),
                 f"{'P' if kind == 'put' else 'C'}={signal.strike} "
                 f"exp={signal.expiry} {signal.note}")
+            self._ae_mark(ts, signal,
+                          "long_put" if kind == "put" else "long_call", tid)
         elif signal.action in ("sell_put_close", "sell_call_close"):
             # Closing a long option.
             kind = "put" if signal.action == "sell_put_close" else "call"

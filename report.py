@@ -41,6 +41,7 @@ section{margin-bottom:28px}h2{font-size:16px;margin-bottom:8px}
 <section><h2>Equity curve</h2><canvas id="eq" width="900" height="260"></canvas><div class="sub" id="eqlegend"></div></section>
 <section><h2>Edge — cumulative realized P&amp;L by strategy <span style="color:#8b949e;font-weight:normal">(closed trades only)</span></h2><canvas id="edge" width="900" height="260"></canvas><div class="sub" id="edgelegend"></div>
 <table id="edgetab"><tr><th>Strategy</th><th>Closed trades</th><th>Win rate</th><th>Expectancy / trade</th><th>Profit factor</th><th>Realized P&amp;L</th></tr></table></section>
+<section><h2>Actual vs expected premium <span style="color:#8b949e;font-weight:normal">(decision-time premium vs FIFO realized, per leg per month — drift below 100% means edge or costs are leaking)</span></h2><table id="ae"><tr><th>Strategy</th><th>Leg</th><th>Month</th><th>Expected</th><th>Realized</th><th>A/E</th><th>Opens</th><th>Closes</th></tr></table></section>
 <section><h2>Open positions</h2><table id="pos"><tr><th>Position</th><th>Qty</th><th>Mark</th><th>Value</th></tr></table></section>
 <section><h2>Strategy P&amp;L</h2><table id="strat"><tr><th>Strategy</th><th>Trades</th><th>Win rate</th><th>Net P&amp;L</th></tr></table></section>
 <section><h2>Recent trades</h2><table id="trades"><tr><th>Time</th><th>Strategy</th><th>Symbol</th><th>Action</th><th>Qty</th><th>Price</th><th>Cash Δ</th><th>Note</th></tr></table></section>
@@ -101,6 +102,13 @@ function row(t,cells){const tr=document.createElement('tr');cells.forEach(c=>{co
      `<span class="${s.realized>=0?'up':'down'}">${fmt$(s.realized)}</span>`]);
  });
  DATA.positions.forEach(p=>row(document.getElementById('pos'),[p.pkey,p.qty,fmt$(p.mark),fmt$(p.qty*p.mark)]));
+ DATA.ae.forEach(r=>{
+   const ae=r.ae_pct==null?'—':r.ae_pct.toFixed(1)+'%';
+   const cls=r.ae_pct==null?'':(r.ae_pct>=100?'up':(r.ae_pct>=90?'':'down'));
+   const cell=cls?`<span class="${cls}">${ae}</span>`:`<span style="color:#8b949e">${ae}</span>`;
+   row(document.getElementById('ae'),[r.strategy,r.leg,r.month,fmt$(r.expected),`<span class="${r.realized>=0?'up':'down'}">${fmt$(r.realized)}</span>`,cell,r.n_opens,r.n_closes]);
+ });
+ if(!DATA.ae.length) row(document.getElementById('ae'),['<span style="color:#8b949e">no opening marks recorded yet — run with option strategies to populate</span>','','','','','','','']);
  DATA.edge_stats.forEach(s=>row(document.getElementById('strat'),[s.strategy,s.n_trades,s.win_rate==null?'—':(s.win_rate*100).toFixed(0)+'%',`<span class="${s.net>=0?'up':'down'}">${fmt$(s.net)}</span>`]));
  DATA.trades.slice(0,50).forEach(t=>row(document.getElementById('trades'),[String(t.ts).slice(0,16),t.strategy,t.symbol,t.action,t.qty,fmt$(t.price),fmt$(t.cash_delta),String(t.note||'').slice(0,60)]));
  DATA.risk.slice(0,50).forEach(r=>row(document.getElementById('risk'),[String(r.ts).slice(0,16),r.strategy,r.symbol,r.action,`<span class="pill">${r.reason}</span>`]));
@@ -128,6 +136,7 @@ def build(db_path: str, compare_db: str | None = None) -> str:
         "risk": led.risk_events(limit=200),
         "rejections": led.rejection_summary(),
         "summary": led.portfolio_summary(),
+        "ae": led.ae_summary(),
     }
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     return HTML.replace("__STAMP__", stamp).replace("__DATA__", json.dumps(data))

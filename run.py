@@ -345,7 +345,24 @@ def _build_feed(args, symbols):
         if args.feed == "csv" else {}
     if args.feed == "polymarket_ws":
         feed_kwargs = {"symbols": symbols}
-    return build_feed(args.feed, **feed_kwargs)
+    return build_feed(args.feed, **feed_kwargs), feed_kwargs
+
+
+def _flight_bundle(args, symbols, strats, feed_name, feed_kwargs,
+                   command: str, run_params: dict) -> str:
+    """Write the flight-recorder bundle next to the ledger DB."""
+    from flight import write_flight_bundle
+    specs = split_specs(args.strategies or "")
+    if args.pie:
+        specs.append(f"pie:{args.pie}")
+    if getattr(args, "book", None):
+        specs.append(f"book:{args.book}")
+    return write_flight_bundle(
+        args.db, command=command, strategy_specs=specs,
+        strategy_names=[s.name for s in strats],
+        scanner_dir=getattr(args, "scanner_dir", None),
+        feed_name=feed_name, feed_params=feed_kwargs,
+        run_params={"symbols": symbols, **run_params})
 
 
 def _print_summary(ledger):
@@ -355,10 +372,18 @@ def _print_summary(ledger):
 
 
 def run_backtest(args, symbols) -> None:
-    feed = _build_feed(args, symbols)
+    feed, feed_kwargs = _build_feed(args, symbols)
     strats = resolve_strategies(args, symbols)
     print(f"feed={feed.name} symbols={symbols} "
           f"strategies={[s.name for s in strats]}")
+    flight_path = _flight_bundle(
+        args, symbols, strats, args.feed, feed_kwargs, "backtest",
+        {"start": args.start, "end": args.end, "capital": args.capital,
+         "slippage_bps": args.slippage_bps,
+         "max_drawdown": args.max_drawdown,
+         "daily_loss_limit": args.daily_loss_limit,
+         "max_exposure": args.max_exposure})
+    print(f"flight recorder: {flight_path}")
     arbiter = RiskArbiter(RiskConfig(
         max_drawdown_frac=args.max_drawdown,
         daily_loss_limit_frac=args.daily_loss_limit,
@@ -374,14 +399,18 @@ def run_backtest(args, symbols) -> None:
 
 
 def run_live(args, symbols) -> None:
-    feed = _build_feed(args, symbols)
+    feed, feed_kwargs = _build_feed(args, symbols)
     strats = resolve_strategies(args, symbols)
     print(f"feed={feed.name} symbols={symbols} "
           f"strategies={[s.name for s in strats]}")
-    arbiter = RiskArbiter(RiskConfig(
-        max_drawdown_frac=args.max_drawdown,
-        daily_loss_limit_frac=args.daily_loss_limit,
-        max_portfolio_exposure_frac=args.max_exposure))
+    flight_path = _flight_bundle(
+        args, symbols, strats, args.feed, feed_kwargs, "live",
+        {"capital": args.capital, "slippage_bps": args.slippage_bps,
+         "max_drawdown": args.max_drawdown,
+         "daily_loss_limit": args.daily_loss_limit,
+         "max_exposure": args.max_exposure,
+         "interval_s": args.interval, "duration_s": args.duration})
+    print(f"flight recorder: {flight_path}")
     ledger = Ledger(args.db)
     engine = PaperEngine(feed, strats, arbiter, ledger,
                          capital=args.capital,
