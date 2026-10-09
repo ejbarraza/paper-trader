@@ -49,8 +49,13 @@ def implied_vol(price: float, S: float, K: float, T_years: float, r: float,
     """Back out sigma from a market price. None if uninvertible.
 
     Fail-closed: returns None for arbitrage-violating prices (below
-    intrinsic) or prices outside the BS attainable range.
+    intrinsic) or prices outside the BS attainable range, and for any
+    non-finite input (a NaN spot/price previously inverted to the 500%
+    bisection cap instead of refusing).
     """
+    if not (math.isfinite(price) and math.isfinite(S) and math.isfinite(K)
+            and math.isfinite(T_years) and math.isfinite(r)):
+        return None
     if T_years <= 0 or S <= 0 or price < 0:
         return None
     pricer = bs_call_price if is_call else bs_put_price
@@ -139,7 +144,12 @@ def build_term_structure(ticker: str, r: float, today: date | None = None):
     expiries = t.options or []
     if not expiries:
         raise SystemExit(f"no option expiries found for {ticker}")
-    S = float(_flatten(t.history(period="5d", auto_adjust=False))["Close"].iloc[-1])
+    closes = _flatten(t.history(period="5d", auto_adjust=False))["Close"].dropna()
+    if closes.empty:
+        raise SystemExit(f"no usable close for {ticker} (yfinance returned no data)")
+    S = float(closes.iloc[-1])
+    if not math.isfinite(S):
+        raise SystemExit(f"no usable close for {ticker} (yfinance returned NaN)")
     rows = []
     for exp in expiries:
         dte = (date.fromisoformat(exp) - today).days

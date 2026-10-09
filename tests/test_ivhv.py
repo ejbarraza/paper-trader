@@ -90,3 +90,64 @@ def test_atm_iv_none_when_no_quotes():
     calls = pd.DataFrame([{"strike": 100.0, "bid": 0.0, "ask": 0.0}])
     puts = pd.DataFrame([{"strike": 100.0, "bid": 0.0, "ask": 1.5}])
     assert atm_iv_for_expiry(calls, puts, 100.0, 0.25, 0.04) is None
+
+
+def test_iv_rejects_nonfinite_inputs():
+    # regression: a NaN spot or price used to invert to the 500% bisection
+    # cap instead of refusing (all-500% IV prints, Oct 8 2026)
+    assert implied_vol(1.0, float("nan"), 100.0, 0.25, 0.04, True) is None
+    assert implied_vol(float("nan"), 100.0, 100.0, 0.25, 0.04, True) is None
+    assert implied_vol(1.0, float("inf"), 100.0, 0.25, 0.04, True) is None
+    assert implied_vol(1.0, 100.0, float("nan"), 0.25, 0.04, False) is None
+
+
+def _fake_ticker(closes, dte=60, sigma=0.30, S=100.0):
+    """Minimal yfinance.Ticker stand-in for build_term_structure()."""
+    from datetime import date, timedelta
+
+    import numpy as np
+
+    exp = (date.today() + timedelta(days=dte)).isoformat()
+    T = dte / 365.0
+    rows_c, rows_p = [], []
+    for K in (95.0, 100.0, 105.0):
+        for frame, pricer, is_c in (
+            (rows_c, bs_call_price, True),
+            (rows_p, bs_put_price, False),
+        ):
+            px = pricer(S, K, T, 0.04, sigma)
+            frame.append({"strike": K, "bid": px * 0.99, "ask": px * 1.01})
+
+    class _Chain:
+        calls = pd.DataFrame(rows_c)
+        puts = pd.DataFrame(rows_p)
+
+    class _FakeTicker:
+        options = [exp]
+
+        def history(self, period=None, auto_adjust=None):
+            return pd.DataFrame({"Close": np.asarray(closes, dtype=float)})
+
+        def option_chain(self, _exp):
+            return _Chain()
+
+    return _FakeTicker
+
+
+def test_term_structure_uses_last_non_nan_close(monkeypatch):
+    yf = pytest.importorskip("yfinance")
+    from ivhv import build_term_structure
+
+    monkeypatch.setattr(yf, "Ticker", lambda _t: _fake_ticker([101.0, 102.0, float("nan")], S=102.0)())
+    rows, S = build_term_structure("BRUN", 0.04)
+    assert S == pytest.approx(102.0)  # not the NaN bar
+    assert rows and rows[0]["avg"] == pytest.approx(0.30, abs=1e-3)
+
+
+def test_term_structure_fails_closed_when_close_all_nan(monkeypatch):
+    yf = pytest.importorskip("yfinance")
+    from ivhv import build_term_structure
+
+    monkeypatch.setattr(yf, "Ticker", lambda _t: _fake_ticker([float("nan")] * 3, S=102.0)())
+    with pytest.raises(SystemExit):
+        build_term_structure("BRUN", 0.04)
